@@ -68,10 +68,10 @@ async def open_settings(message: Message):
     await message.answer("⚙️ <b>Настройки</b>\nВыберите раздел:", reply_markup=settings_menu_kb(), parse_mode="HTML")
 
 
-@router.message(F.text == "📅 Настройки дедлайнов")
+@router.message(F.text == "📅 Дедлайны")
 async def open_display_settings_msg(message: Message):
     """Открывает меню настроек отображения из главного меню настроек."""
-    await message.answer("📅 <b>Настройки дедлайнов</b>\n\nВыбери, как выводить дедлайны:", reply_markup=display_settings_kb(message.from_user.id), parse_mode="HTML")
+    await message.answer("📅 <b>Дедлайны</b>\n\nВыбери, как выводить дедлайны:", reply_markup=display_settings_kb(message.from_user.id), parse_mode="HTML")
 
 @router.message(F.text == "📋 Kanban")
 async def open_kanban_settings(message: Message):

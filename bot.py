@@ -241,7 +241,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 def settings_menu_kb() -> ReplyKeyboardMarkup:
     """Создает клавиатуру меню настроек (Reply)."""
     kb = [
-        [KeyboardButton(text="🛎️ Уведомления"), KeyboardButton(text="📅 Настройки дедлайнов")],
+        [KeyboardButton(text="🛎️ Уведомления"), KeyboardButton(text="📅 Дедлайны")],
         [KeyboardButton(text="📋 Kanban"), KeyboardButton(text="📁 Projects"), KeyboardButton(text="📝 Tasks/Todo")],
         [KeyboardButton(text="⚙️ Дополнительные настройки")],
         [KeyboardButton(text="🏠 В главное меню")]
