@@ -23,6 +23,10 @@ from bot import (
 
 router = Router()
 
+# Словарь для отслеживания активной Reply-клавиатуры (main/settings).
+# Решает конфликт одинаковых текстов кнопок в разных меню без FSM.
+user_menus = {}
+
 
 # ==============================================================================
 # 1. ХЭНДЛЕРЫ БАЗОВЫХ КОМАНД
@@ -34,6 +38,7 @@ async def cmd_start(message: Message):
     if uid not in user_settings: user_settings[uid] = default_settings()
     else: user_settings[uid]["is_active"] = True
     save_user_settings()
+    user_menus[uid] = "main" # NEW: Фиксируем активное меню
     await message.answer("Привет! Я бот для Obsidian. Выбери статус задач внизу:", reply_markup=main_menu_kb())
 
 
@@ -50,6 +55,7 @@ async def cmd_stop(message: Message):
 @router.message(Command("menu"))
 async def cmd_menu(message: Message):
     """Открывает главное меню."""
+    user_menus[message.from_user.id] = "main" # NEW: Фиксируем активное меню
     await message.answer("🏠 Главное меню:", reply_markup=main_menu_kb())
 
 
@@ -65,13 +71,9 @@ async def cmd_help(message: Message):
 @router.message(F.text == "⚙️ Настройки")
 async def open_settings(message: Message):
     """Открывает меню настроек (Reply клавиатура)."""
+    user_menus[message.from_user.id] = "settings" # NEW: Фиксируем активное меню
     await message.answer("⚙️ <b>Настройки</b>\nВыберите раздел:", reply_markup=settings_menu_kb(), parse_mode="HTML")
 
-
-@router.message(F.text == "📅 Дедлайны")
-async def open_display_settings_msg(message: Message):
-    """Открывает меню настроек отображения из главного меню настроек."""
-    await message.answer("📅 <b>Дедлайны</b>\n\nВыбери, как выводить дедлайны:", reply_markup=display_settings_kb(message.from_user.id), parse_mode="HTML")
 
 @router.message(F.text == "📋 Kanban")
 async def open_kanban_settings(message: Message):
@@ -103,6 +105,7 @@ async def open_extra_settings(message: Message):
 @router.callback_query(F.data == "back_to_settings_menu")
 async def back_to_settings_menu(callback: CallbackQuery):
     """Возвращает из inline-настроек в меню настроек (Reply)."""
+    user_menus[callback.from_user.id] = "settings" # NEW: Фиксируем активное меню
     try: await callback.message.delete()
     except TelegramBadRequest: pass
     await callback.message.answer("⚙️ <b>Настройки</b>\nВыберите раздел:", reply_markup=settings_menu_kb(), parse_mode="HTML")
@@ -112,6 +115,7 @@ async def back_to_settings_menu(callback: CallbackQuery):
 @router.message(F.text == "🏠 В главное меню")
 async def back_to_main_menu(message: Message):
     """Возвращает из меню настроек в главное меню."""
+    user_menus[message.from_user.id] = "main" # NEW: Фиксируем активное меню
     await message.answer("🏠 Главное меню:", reply_markup=main_menu_kb())
 
 
@@ -267,9 +271,15 @@ async def set_projects_sort_dir(callback: CallbackQuery):
 # 4. ХЭНДЛЕРЫ ДЕДЛАЙНОВ И РЕНДЕР
 # ==============================================================================
 @router.message(F.text == "📅 Дедлайны")
-async def show_upcoming_msg(message: Message):
-    """Выводит дедлайны за 1 день (по кнопке Reply-клавиатуры)."""
-    await render_upcoming(message, "1", 0, is_callback=False)
+async def handle_deadlines_msg(message: Message):
+    """Обрабатывает кнопку '📅 Дедлайны' в зависимости от текущего меню (Конфликт-фри)."""
+    uid = message.from_user.id
+    if user_menus.get(uid) == "settings":
+        # CHANGED: Если нажато из меню настроек, открываем настройки отображения
+        await message.answer("📅 <b>Настройки дедлайнов</b>\n\nВыбери, как выводить дедлайны:", reply_markup=display_settings_kb(uid), parse_mode="HTML")
+    else:
+        # По умолчанию (из главного меню) выводим список
+        await render_upcoming(message, "1", 0, is_callback=False)
 
 
 @router.callback_query(F.data.startswith("up|"))
