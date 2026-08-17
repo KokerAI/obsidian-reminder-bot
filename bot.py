@@ -70,7 +70,10 @@ if WATCHDOG_AVAILABLE:
 
 # --- ИНИЦИАЛИЗАЦИЯ БОТА ---
 # Создаем сессию с прокси и таймаутом из конфига
-session = AiohttpSession(proxy=config.PROXY_URL, timeout=config.REQUEST_TIMEOUT)
+# Умная проверка прокси
+active_proxy = utils.get_active_proxy()
+session = AiohttpSession(proxy=active_proxy, timeout=config.REQUEST_TIMEOUT)
+# session = AiohttpSession(proxy=config.PROXY_URL, timeout=config.REQUEST_TIMEOUT)
 bot = Bot(token=config.BOT_TOKEN, session=session)
 dp = Dispatcher()
 

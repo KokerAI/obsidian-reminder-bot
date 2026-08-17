@@ -3,10 +3,34 @@
 Содержит вспомогательные функции и классы для дат, логирования и централизованной сортировки,
 чтобы избежать дублирования кода (DRY) и циклических зависимостей между модулями.
 """
+import socket
 import config
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
+
+def get_active_proxy() -> Optional[str]:
+    """
+    Умная проверка прокси.
+    Если в .env жестко прописан PROXY_URL - использует его.
+    Иначе проверяет порт 10808. Если открыт - возвращает прокси.
+    Если закрыт - возвращает None.
+    """
+    if config.PROXY_URL:
+        return config.PROXY_URL
+
+    host, port = "127.0.0.1", 10808
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            if s.connect_ex((host, port)) == 0:
+                print(f"[Utils] Порт {port} открыт (HAPP). Включаю прокси.")
+                return f"http://{host}:{port}"
+            else:
+                print(f"[Utils] Порт {port} закрыт (INCI/VPN выкл). Прокси выключен.")
+                return None
+    except Exception:
+        return None
 
 def get_now() -> datetime:
     """

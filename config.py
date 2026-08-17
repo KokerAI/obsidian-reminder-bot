@@ -16,7 +16,8 @@ load_dotenv()
 # --- Telegram ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_ID = int(os.getenv("CHAT_ID", 0))
-PROXY_URL = os.getenv("PROXY_URL", "http://127.0.0.1:10809")
+# PROXY_URL = os.getenv("PROXY_URL", "http://127.0.0.1:10808")
+PROXY_URL = os.getenv("PROXY_URL")
 REQUEST_TIMEOUT = 120  # Таймаут ожидания ответа от Telegram в секундах
 
 # --- Логирование ---
