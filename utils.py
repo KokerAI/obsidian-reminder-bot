@@ -3,34 +3,52 @@
 Содержит вспомогательные функции и классы для дат, логирования и централизованной сортировки,
 чтобы избежать дублирования кода (DRY) и циклических зависимостей между модулями.
 """
+import os
 import socket
+import logging
 import config
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-
+# NEW: Умная функция авто-определения прокси
 def get_active_proxy() -> Optional[str]:
     """
     Умная проверка прокси.
-    Если в .env жестко прописан PROXY_URL - использует его.
-    Иначе проверяет порт 10808. Если открыт - возвращает прокси.
-    Если закрыт - возвращает None.
+    1. Если PROXY_URL задан в .env — использует его (жесткий режим).
+    2. Иначе перебирает список популярных портов локальных прокси (HAPP, INCI, v2ray, Psiphon).
+       Если находит открытый порт — собирает URL из PROXY_TYPE, PROXY_USER, PROXY_PASS.
+    3. Если все порты закрыты — возвращает None (прямое соединение).
     """
     if config.PROXY_URL:
         return config.PROXY_URL
 
-    host, port = "127.0.0.1", 10808
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1)
-            if s.connect_ex((host, port)) == 0:
-                print(f"[Utils] Порт {port} открыт (HAPP). Включаю прокси.")
-                return f"http://{host}:{port}"
-            else:
-                print(f"[Utils] Порт {port} закрыт (INCI/VPN выкл). Прокси выключен.")
-                return None
-    except Exception:
-        return None
+    host = "127.0.0.1"
+    # Список популярных портов для локальных VPN-клиентов
+    ports_to_check = [10808, 10809, 12334, 1080, 8080]
+
+    proxy_type = os.getenv("PROXY_TYPE", "socks5").lower()
+    proxy_user = os.getenv("PROXY_USER")
+    proxy_pass = os.getenv("PROXY_PASS")
+
+    for port in ports_to_check:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1) # Ждем ответа 1 секунду
+                if s.connect_ex((host, port)) == 0:
+                    logging.info(f"[Utils] Порт {port} открыт. Включаю прокси.")
+
+                    # Если есть логин и пароль, склеиваем с ними
+                    if proxy_user and proxy_pass:
+                        return f"{proxy_type}://{proxy_user}:{proxy_pass}@{host}:{port}"
+                    # Если пароля нет, склеиваем без него
+                    else:
+                        return f"{proxy_type}://{host}:{port}"
+        except Exception as e:
+            logging.error(f"[Utils] Ошибка при проверке порта {port}: {e}")
+            continue # Если порт вызвал ошибку (например, занят чем-то другим), просто идем к следующему
+
+    logging.info("[Utils] Все проверенные порты закрыты. Прокси выключен.")
+    return None
 
 def get_now() -> datetime:
     """
