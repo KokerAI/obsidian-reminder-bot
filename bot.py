@@ -31,15 +31,17 @@ logger = logging.getLogger()
 logger.setLevel(LOG_LEVEL)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-# Запись в файл (макс 5 МБ, храним 3 последних файла)
-file_handler = RotatingFileHandler('bot.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+# Защита от дублирования хендлеров при повторных импортах (циклический импорт)
+if not logger.handlers:
+    # Запись в файл (макс 5 МБ, храним 3 последних файла)
+    file_handler = RotatingFileHandler('bot.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
-# Вывод в консоль
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+    # Вывод в консоль
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 # --- WATCHDOG (ОПЦИОНАЛЬНО) ---
 # Библиотека для мгновенного обновления кэша при изменении файлов Obsidian.
@@ -668,6 +670,3 @@ async def main():
             observer.stop()
             observer.join()
         await bot.session.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())

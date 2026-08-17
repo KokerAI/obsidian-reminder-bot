@@ -335,22 +335,14 @@ def get_upcoming_notes(max_date: datetime = None) -> list:
     if max_date is None: max_date = now + timedelta(days=1)
     active_sources = [key for key, val in config.SOURCES.items() if val.get("enabled")]
     for src in active_sources:
-        # Если источник Projects, ищем во всех его подпапках
-        if src == 'projects':
-            for proj in get_projects_list():
-                for n in get_notes(source=src, project_name=proj):
-                    # Фильтр скрытия выполненных задач
-                    if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
-                    if n['due'] and now <= n['due'] <= max_date: upcoming.append(n); continue
-                    for t in n['tasks']:
-                        if t['due'] and not t['done'] and now <= t['due'] <= max_date: upcoming.append(n); break
-        else:
-            for n in get_notes(source=src):
-                # Фильтр скрытия выполненных задач
-                if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
-                if n['due'] and now <= n['due'] <= max_date: upcoming.append(n); continue
-                for t in n['tasks']:
-                    if t['due'] and not t['done'] and now <= t['due'] <= max_date: upcoming.append(n); break
+        # FIX: Сканируем всю папку источника (включая корень и подпапки) одним вызовом.
+        # Ранее для Projects сканировались только подпапки, из-за чего заметки в корне Projects игнорировались.
+        for n in get_notes(source=src):
+            # Фильтр скрытия выполненных задач
+            if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
+            if n['due'] and now <= n['due'] <= max_date: upcoming.append(n); continue
+            for t in n['tasks']:
+                if t['due'] and not t['done'] and now <= t['due'] <= max_date: upcoming.append(n); break
     return upcoming
 
 def get_overdue_notes() -> list:
@@ -360,30 +352,21 @@ def get_overdue_notes() -> list:
     min_date = now - timedelta(days=getattr(config, 'OVERDUE_DAYS_LIMIT', 30))
     active_sources = [key for key, val in config.SOURCES.items() if val.get("enabled")]
     for src in active_sources:
-        # Если источник Projects, ищем во всех его подпапках
-        if src == 'projects':
-            for proj in get_projects_list():
-                for n in get_notes(source=src, project_name=proj):
-                    # Фильтр скрытия выполненных задач
-                    if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
-                    if n['due'] and min_date <= n['due'] < now: overdue.append(n); continue
-                    for t in n['tasks']:
-                        if t['due'] and not t['done'] and min_date <= t['due'] < now: overdue.append(n); break
-        else:
-            for n in get_notes(source=src):
-                # Фильтр скрытия выполненных задач
-                if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
-                # Проверяем основной дедлайн заметки (включая Fallback)
-                if n['due'] and min_date <= n['due'] < now:
-                    overdue.append(n)
-                    continue
+        # FIX: Сканируем всю папку источника (включая корень и подпапки) одним вызовом.
+        for n in get_notes(source=src):
+            # Фильтр скрытия выполненных задач
+            if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
+            # Проверяем основной дедлайн заметки (включая Fallback)
+            if n['due'] and min_date <= n['due'] < now:
+                overdue.append(n)
+                continue
 
-                # Если основного дедлайна нет (или он не просрочен), жестко проверяем подзадачи
-                # (Этот цикл теперь правильно находится внутри цикла for n)
-                for t in n['tasks']:
-                    if t['due'] and not t['done'] and min_date <= t['due'] < now:
-                        overdue.append(n)
-                        break
+            # Если основного дедлайна нет (или он не просрочен), жестко проверяем подзадачи
+            # (Этот цикл теперь правильно находится внутри цикла for n)
+            for t in n['tasks']:
+                if t['due'] and not t['done'] and min_date <= t['due'] < now:
+                    overdue.append(n)
+                    break
     return overdue
 
 def get_active_notes_for_notify(use_cache: bool = True) -> list:
@@ -394,22 +377,13 @@ def get_active_notes_for_notify(use_cache: bool = True) -> list:
     notes = []
     active_sources = [key for key, val in config.SOURCES.items() if val.get("enabled")]
     for src in active_sources:
-        # ИЗМЕНЕНО: Если источник Projects, ищем во всех его подпапках
-        if src == 'projects':
-            for proj in get_projects_list():
-                for n in get_notes(source=src, project_name=proj):
-                    if config.ACTIVE_STATUSES:
-                        if n['status'] not in config.ACTIVE_STATUSES: continue
-                    else:
-                        if n['status'] in INACTIVE_STATUSES: continue
-                    if n['due'] or any(t['due'] for t in n['tasks'] if not t['done']): notes.append(n)
-        else:
-            for n in get_notes(source=src):
-                if config.ACTIVE_STATUSES:
-                    if n['status'] not in config.ACTIVE_STATUSES: continue
-                else:
-                    if n['status'] in INACTIVE_STATUSES: continue
-                if n['due'] or any(t['due'] for t in n['tasks'] if not t['done']): notes.append(n)
+        # Сканируем всю папку источника (включая корень и подпапки) одним вызовом.
+        for n in get_notes(source=src):
+            if config.ACTIVE_STATUSES:
+                if n['status'] not in config.ACTIVE_STATUSES: continue
+            else:
+                if n['status'] in INACTIVE_STATUSES: continue
+            if n['due'] or any(t['due'] for t in n['tasks'] if not t['done']): notes.append(n)
     _notify_cache["last_fetch"] = now
     _notify_cache["data"] = notes
     return notes

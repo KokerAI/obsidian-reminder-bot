@@ -3,6 +3,8 @@ venv/
 .venv/
 env/
 ENV/
+.venv_linux/
+.venv_windows/
 
 # --- Кэш Python и скомпилированные файлы ---
 __pycache__/
@@ -46,3 +48,9 @@ dist/
 .DS_Store
 # Windows
 Thumbs.db
+
+# --- Файлы сборки и дистрибутивы (если будешь собирать пакет) ---
+build/
+dist/
+*.egg-info/
+*.egg
