@@ -227,7 +227,8 @@ async def safe_edit(callback: CallbackQuery, text: Optional[str] = None, reply_m
 # --- КЛАВИАТУРЫ ---
 def main_menu_kb() -> ReplyKeyboardMarkup:
     """Создает главную клавиатуру (Reply), скрывая кнопки отключенных источников."""
-    kb = [[KeyboardButton(text="📅 Дедлайны")]]
+    # Тексты берутся из config.py
+    kb = [[KeyboardButton(text=config.BTN_DEADLINES)]]
     # ---
     # Группировка кнопок источников в один ряд
     # row = [KeyboardButton(text=btn_text) for btn_text, src_key in SOURCE_BUTTONS.items() if config.SOURCES.get(src_key, {}).get("enabled")]
@@ -240,17 +241,19 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     for i in range(0, len(src_buttons), 3):
         kb.append(src_buttons[i:i+3])
     # ---
-    kb.append([KeyboardButton(text="⚙️ Настройки")])
+    kb.append([KeyboardButton(text=config.BTN_SETTINGS)])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def settings_menu_kb() -> ReplyKeyboardMarkup:
     """Создает клавиатуру меню настроек (Reply)."""
+    # CHANGED: Тексты берутся из config.py, а кнопки источников генерируются автоматически
     kb = [
-        [KeyboardButton(text="🛎️ Уведомления"), KeyboardButton(text="📅 Дедлайны")],
-        [KeyboardButton(text="📋 Kanban"), KeyboardButton(text="📁 Projects"), KeyboardButton(text="📝 Tasks/Todo")],
-        [KeyboardButton(text="⚙️ Дополнительные настройки")],
-        [KeyboardButton(text="🏠 В главное меню")]
+        [KeyboardButton(text=config.BTN_NOTIFY), KeyboardButton(text=config.BTN_DEADLINES)],
+        [KeyboardButton(text=btn_text) for btn_text, src_key in SOURCE_BUTTONS.items() if config.SOURCES.get(src_key, {}).get("enabled")],
+        [KeyboardButton(text=config.BTN_EXTRA_SETTINGS)],
+        [KeyboardButton(text=config.BTN_MAIN_MENU)]
     ]
+    kb = [row for row in kb if row]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def upcoming_kb(period, page, total_count, limit=config.PAGINATION_LIMIT) -> InlineKeyboardMarkup:
