@@ -19,6 +19,7 @@ from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, TelegramObject, ReplyKeyboardMarkup, KeyboardButton, BotCommand)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
 from aiohttp import ClientError
 from typing import Any, Callable, Dict, Awaitable, Optional
@@ -74,7 +75,9 @@ if WATCHDOG_AVAILABLE:
 active_proxy = utils.get_active_proxy()
 session = AiohttpSession(proxy=active_proxy, timeout=config.REQUEST_TIMEOUT)
 # session = AiohttpSession(proxy=config.PROXY_URL, timeout=config.REQUEST_TIMEOUT)
-bot = Bot(token=config.BOT_TOKEN, session=session)
+# NEW: Глобально отключаем превью ссылок во ВСЕХ сообщениях (send_message и edit_text),
+# включая пуши, сводку и редактирование при пагинации. Тумблер — DISABLE_LINK_PREVIEW в config.py.
+bot = Bot(token=config.BOT_TOKEN, session=session, default=DefaultBotProperties(link_preview_is_disabled=config.DISABLE_LINK_PREVIEW))
 dp = Dispatcher()
 
 # Абсолютный путь к файлу настроек (защита от потери при запуске из другой директории)
