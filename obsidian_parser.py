@@ -45,6 +45,11 @@ if config.ENABLE_DATAVIEW:
 # Голая дата (строго в конце строки)
 if config.ENABLE_BARE_DATES:
     _task_date_regexes.append(re.compile(rf'(?P<date>{_date_part})\s*$'))
+# Даты Kanban-плагина: нативный маркер "@{дата}" / "@{дата время}" (пару
+# "@{дата} @@{время}" сливает _process_kanban_body). Позиция в строке любая,
+# как у эмодзи-маркера Tasks. Хвостовые ⏫/теги/`` дедлайн не отрезают.
+if config.ENABLE_KANBAN_DATES:
+    _task_date_regexes.append(re.compile(rf'@\{{\s*(?P<date>{_date_part})\s*\}}'))
 
 # Паттерны классификации строк
 _CHECKBOX_LINE = re.compile(r'^\s*[-*+]\s*\[(?P<status>[ xX])\]\s*(?P<rest>.*)$')
@@ -158,23 +163,29 @@ def _process_kanban_body(body: str) -> str:
             if "**complete**" in text.lower():
                 text = re.sub(r'\*\*[Cc]omplete\*\*', '', text, flags=re.IGNORECASE).strip()
                 if " ✓" not in text: text += " ✓"
-            # NEW: Даты Kanban-плагина "@{дата} @@{время}" → "📅 дата время".
-            # Конвертируем ДО срезания "@{}"/скобок ниже: дату с маркером 📅 парсер
-            # находит в любом месте строки, поэтому хвостовые ⏫/теги/`` не отрезают дедлайн.
-            # Порядок важен: сначала пара "дата + время", затем одиночная дата.
+            # NEW: Даты Kanban-плагина — нативный маркер "@{дата}" (regex в _task_date_regexes).
+            # Сначала нормализуем пробел между "@"/"@@" и "{" (ручной ввод " @ {…}"),
+            # затем пару "@{дата} @@{время}" сливаем в один маркер "@{дата время}".
+            # Часы строго 2 цифры (формат плагина HH:mm). Маркер парсится в любом
+            # месте строки, поэтому хвостовые ⏫/теги/`` не отрезают дедлайн.
+            if config.ENABLE_KANBAN_DATES:
+                text = re.sub(r'(@+)\s+\{', r'\1{', text)
+                text = re.sub(
+                    rf'@\{{\s*({_date_part})\s*\}}\s*@@\{{\s*(\d{{2}}(?:{_time_sep_pattern}\d{{2}})?)\s*\}}',
+                    r'@{\1 \2}',
+                    text
+                )
+            # NEW: "@@{время}" без даты — привязываем время к текущему дню (тумблер в
+            # конфиге, по умолчанию ВЫКЛ; работает только при ENABLE_KANBAN_DATES).
+            # Только если в строке нет другой даты дедлайна — маркера "@{…}" или эмодзи
+            # Tasks, иначе из одной карточки вышло бы две задачи.
+            if config.ENABLE_KANBAN_DATES and config.ENABLE_KANBAN_TIME_ONLY and not re.search(r'(?<!@)@\{', text) and not any(ic in text for ic in config.TASKS_DUE_EMOJI):
+                text = re.sub(rf'@@\{{\s*(\d{{2}}(?:{_time_sep_pattern}\d{{2}})?)\s*\}}', rf'@{{{today_str} \1}}', text)
+            # CHANGED: (?<!@) защищает нативные маркеры "@{…}"/"@@{…}" от разворачивания
+            # скобок — без него стрипер съедал их и дедлайн терялся. Остальные случаи
+            # (эмодзи+скобки, обычные скобки) обрабатываются как раньше.
             text = re.sub(
-                rf'@\{{\s*({_date_part})\s*\}}\s*@@\{{\s*(\d{{1,2}}(?:{_time_sep_pattern}\d{{2}})?)\s*\}}',
-                r' 📅 \1 \2',
-                text
-            )
-            text = re.sub(rf'@\{{\s*({_date_part})\s*\}}', r' 📅 \1', text)
-            # NEW: "@@{время}" без даты — привязываем время к текущему дню (тумблер в конфиге,
-            # по умолчанию ВЫКЛ). Только если в строке нет другой даты дедлайна,
-            # иначе из одной карточки получилось бы две задачи.
-            if config.ENABLE_KANBAN_TIME_ONLY and not any(ic in text for ic in config.TASKS_DUE_EMOJI):
-                text = re.sub(rf'@@\{{\s*(\d{{1,2}}(?:{_time_sep_pattern}\d{{2}})?)\s*\}}', rf' 📅 {today_str} \1', text)
-            text = re.sub(
-                r'([^\w\[\]\{\}\(\)]*)\s*[\{\(]([^}\)]*\d[^}\)]*)[\}\)]',
+                r'([^\w\[\]\{\}\(\)]*)\s*(?<!@)[\{\(]([^}\)]*\d[^}\)]*)[\}\)]',
                 lambda match: f" {match.group(1).strip()} {match.group(2)} " if match.group(1).strip() in config.TASKS_DUE_EMOJI else f" {match.group(2)} ",
                 text
             )

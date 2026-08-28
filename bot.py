@@ -668,13 +668,6 @@ async def main():
     except Exception as e:
         logging.error(f"Ошибка парсинга DIGEST_TIME: {e}")
 
-    # NEW: Предупреждение о "ножницах" в конфиге: конвертация "@{дата}" в "📅 …" на карточках
-    # Kanban имеет смысл только при ENABLE_TASKS_EMOJI = True — эмодзи единственный маркер,
-    # который парсер распознает в любом месте строки (голая дата требует конца строки).
-    if config.SOURCES.get("kanban", {}).get("enabled") and not config.ENABLE_TASKS_EMOJI:
-        logging.warning("[КОНФИГ] Источник Kanban включен, но ENABLE_TASKS_EMOJI = False: "
-                        "даты @{…} на карточках борд распознаваться НЕ будут.")
-
     scheduler.start()
     logging.info(f"Планировщик запущен. Бот работает для CHAT_ID: {config.ALLOWED_ID}")
 
