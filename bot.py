@@ -470,6 +470,18 @@ def format_note_card(note: Dict[str, Any], show_source: bool = False) -> str:
     text = text.rstrip(' \n') + "\n" + "⠀" * 60
     return f"<blockquote>{text}</blockquote>\n"
 
+
+# NEW: Карточка для пуша по подзадаче (карточке Kanban / чекбоксу). В компактном
+# режиме (NOTIFY_CARD_ONLY в конфиге) — только файл и дата, без тела всей заметки/борды.
+def _task_notify_card(note: Dict[str, Any], task_text: Optional[str], due_dt: datetime) -> str:
+    if task_text and config.NOTIFY_CARD_ONLY:
+        text = f"{CARD_ICON} <b>{html.escape(str(note['filename']))}</b>\n📅 {due_dt.strftime('%d.%m.%Y %H:%M')}\n"
+        # Трюк для растягения blockquote на всю ширину (60 невидимых символов)
+        text = text.rstrip(' \n') + "\n" + "⠀" * 60
+        return f"<blockquote>{text}</blockquote>\n"
+    return format_note_card(note)
+
+
 # --- ПЛАНИРОВЩИК И УВЕДОМЛЕНИЯ ---
 async def check_and_notify():
     """Фоновая задача планировщика (APScheduler). Запускается каждую минуту."""
@@ -531,7 +543,15 @@ async def send_daily_digest():
         if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
 
         due = utils.get_note_due(n)
-        if due != datetime.max and start_of_today <= due <= end_of_today:
+        # CHANGED: Проверяем не только дедлайн заметки, но и подзадачи (карточки Kanban / чекбоксы):
+        # иначе задача на сегодня не попадет в сводку, если у заметки/борды есть более ранняя дата.
+        in_window = due != datetime.max and start_of_today <= due <= end_of_today
+        if not in_window:
+            in_window = any(
+                t['due'] and not t['done'] and start_of_today <= t['due'] <= end_of_today
+                for t in n.get('tasks', [])
+            )
+        if in_window:
             if n['filename'] not in notes_set:
                 notes_set.add(n['filename'])
                 all_notes.append(n)
@@ -590,8 +610,10 @@ async def process_due(user_id, settings, due_dt, note, task_text=None):
             if notify_key not in settings["notified_tasks"]:
                 logging.info(f"[УВЕДОМЛЕНИЕ] Срабатывание интервала -{interval} мин. Ключ: {notify_key}")
                 msg = f"⏰ <b>Напоминание (-{interval} мин)!</b>\n"
-                if task_text: msg += f"Задача: {task_text}\n"
-                msg += format_note_card(note)
+                # CHANGED: Экранируем текст задачи (HTML) — карточки с <, >, & раньше ломали отправку пуша
+                if task_text: msg += f"Задача: {html.escape(task_text)}\n"
+                # CHANGED: Компактный режим пуша по задаче (NOTIFY_CARD_ONLY) или полная карточка заметки
+                msg += _task_notify_card(note, task_text, due_dt)
                 try:
                     await bot.send_message(user_id, msg, parse_mode="HTML", disable_notification=disable_notif)
                     settings["notified_tasks"].add(notify_key)
@@ -609,8 +631,10 @@ async def process_due(user_id, settings, due_dt, note, task_text=None):
         if notify_key not in settings["notified_tasks"]:
             logging.info(f"[УВЕДОМЛЕНИЕ] Срабатывание 'В момент начала'. Ключ: {notify_key}")
             msg = f"🚨 <b>ПРЯМО СЕЙЧАС!</b>\n"
-            if task_text: msg += f"Задача: {task_text}\n"
-            msg += format_note_card(note)
+            # CHANGED: Экранируем текст задачи (HTML) — карточки с <, >, & раньше ломали отправку пуша
+            if task_text: msg += f"Задача: {html.escape(task_text)}\n"
+            # CHANGED: Компактный режим пуша по задаче (NOTIFY_CARD_ONLY) или полная карточка заметки
+            msg += _task_notify_card(note, task_text, due_dt)
             try:
                 await bot.send_message(user_id, msg, parse_mode="HTML", disable_notification=disable_notif)
                 settings["notified_tasks"].add(notify_key)
@@ -643,6 +667,13 @@ async def main():
         scheduler.add_job(send_daily_digest, 'cron', hour=d_hour, minute=d_minute)
     except Exception as e:
         logging.error(f"Ошибка парсинга DIGEST_TIME: {e}")
+
+    # NEW: Предупреждение о "ножницах" в конфиге: конвертация "@{дата}" в "📅 …" на карточках
+    # Kanban имеет смысл только при ENABLE_TASKS_EMOJI = True — эмодзи единственный маркер,
+    # который парсер распознает в любом месте строки (голая дата требует конца строки).
+    if config.SOURCES.get("kanban", {}).get("enabled") and not config.ENABLE_TASKS_EMOJI:
+        logging.warning("[КОНФИГ] Источник Kanban включен, но ENABLE_TASKS_EMOJI = False: "
+                        "даты @{…} на карточках борд распознаваться НЕ будут.")
 
     scheduler.start()
     logging.info(f"Планировщик запущен. Бот работает для CHAT_ID: {config.ALLOWED_ID}")

@@ -115,9 +115,10 @@ def _process_kanban_body(body: str) -> str:
     valid_indices = [i for i in [cut_idx_1, cut_idx_2] if i > 0]
     if valid_indices: body = body[:min(valid_indices)].strip()
 
-    # ИСПРАВЛЕНО: Убрана мертвая переменная is_done_column, инициализация в одну строку
     new_lines, skip_next_empty = [], False
     current_col = "" # НОВОЕ: Переменная для хранения имени текущей колонки
+    # "Сегодня" для привязки "@@{время}" без даты к текущему дню (режим ENABLE_KANBAN_TIME_ONLY)
+    today_str = utils.get_now().strftime("%Y-%m-%d") if config.ENABLE_KANBAN_TIME_ONLY else ""
 
     for l in body.splitlines():
         if skip_next_empty and not l.strip():
@@ -157,6 +158,21 @@ def _process_kanban_body(body: str) -> str:
             if "**complete**" in text.lower():
                 text = re.sub(r'\*\*[Cc]omplete\*\*', '', text, flags=re.IGNORECASE).strip()
                 if " ✓" not in text: text += " ✓"
+            # NEW: Даты Kanban-плагина "@{дата} @@{время}" → "📅 дата время".
+            # Конвертируем ДО срезания "@{}"/скобок ниже: дату с маркером 📅 парсер
+            # находит в любом месте строки, поэтому хвостовые ⏫/теги/`` не отрезают дедлайн.
+            # Порядок важен: сначала пара "дата + время", затем одиночная дата.
+            text = re.sub(
+                rf'@\{{\s*({_date_part})\s*\}}\s*@@\{{\s*(\d{{1,2}}(?:{_time_sep_pattern}\d{{2}})?)\s*\}}',
+                r' 📅 \1 \2',
+                text
+            )
+            text = re.sub(rf'@\{{\s*({_date_part})\s*\}}', r' 📅 \1', text)
+            # NEW: "@@{время}" без даты — привязываем время к текущему дню (тумблер в конфиге,
+            # по умолчанию ВЫКЛ). Только если в строке нет другой даты дедлайна,
+            # иначе из одной карточки получилось бы две задачи.
+            if config.ENABLE_KANBAN_TIME_ONLY and not any(ic in text for ic in config.TASKS_DUE_EMOJI):
+                text = re.sub(rf'@@\{{\s*(\d{{1,2}}(?:{_time_sep_pattern}\d{{2}})?)\s*\}}', rf' 📅 {today_str} \1', text)
             text = re.sub(
                 r'([^\w\[\]\{\}\(\)]*)\s*[\{\(]([^}\)]*\d[^}\)]*)[\}\)]',
                 lambda match: f" {match.group(1).strip()} {match.group(2)} " if match.group(1).strip() in config.TASKS_DUE_EMOJI else f" {match.group(2)} ",
@@ -216,7 +232,10 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
     for md_file in search_path.rglob("*.md"):
         if ".obsidian" in md_file.parts or ".trash" in md_file.parts: continue
         try:
-            content = md_file.read_text(encoding="utf-8")
+            # CHANGED: utf-8-sig срезает BOM в начале файла, если он есть; обычные UTF-8
+            # файлы читаются без изменений. Без этого frontmatter файла с BOM молча
+            # не распознавался (строка начиналась с \ufeff, а не с '---')
+            content = md_file.read_text(encoding="utf-8-sig")
             metadata = {}
             body = content
 
@@ -227,7 +246,10 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
                     yaml_block = content[3:end_fm]
                     body = content[end_fm + 3:].strip()
                     try: metadata = yaml.safe_load(yaml_block) or {}
-                    except yaml.YAMLError: pass
+                    # NEW: Раньше ошибка YAML глоталась молча: заметка/борда теряла весь
+                    # frontmatter (kanban-plugin, due, status) без единого следа в логах
+                    except yaml.YAMLError as e:
+                        logging.error(f"[PARSER] YAML не спарсился в {md_file.name}: {e}")
 
                     # ИСПРАВЛЕНО: Защита от YAML, который не является словарем (например, просто строка или список)
                     if not isinstance(metadata, dict):
