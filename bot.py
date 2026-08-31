@@ -19,6 +19,7 @@ from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, TelegramObject, ReplyKeyboardMarkup, KeyboardButton, BotCommand)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
 from aiohttp import ClientError
 from typing import Any, Callable, Dict, Awaitable, Optional
@@ -31,15 +32,17 @@ logger = logging.getLogger()
 logger.setLevel(LOG_LEVEL)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-# Запись в файл (макс 5 МБ, храним 3 последних файла)
-file_handler = RotatingFileHandler('bot.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+# Защита от дублирования хендлеров при повторных импортах (циклический импорт)
+if not logger.handlers:
+    # Запись в файл (макс 5 МБ, храним 3 последних файла)
+    file_handler = RotatingFileHandler('bot.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
-# Вывод в консоль
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+    # Вывод в консоль
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 # --- WATCHDOG (ОПЦИОНАЛЬНО) ---
 # Библиотека для мгновенного обновления кэша при изменении файлов Obsidian.
@@ -68,8 +71,13 @@ if WATCHDOG_AVAILABLE:
 
 # --- ИНИЦИАЛИЗАЦИЯ БОТА ---
 # Создаем сессию с прокси и таймаутом из конфига
-session = AiohttpSession(proxy=config.PROXY_URL, timeout=config.REQUEST_TIMEOUT)
-bot = Bot(token=config.BOT_TOKEN, session=session)
+# Умная проверка прокси
+active_proxy = utils.get_active_proxy()
+session = AiohttpSession(proxy=active_proxy, timeout=config.REQUEST_TIMEOUT)
+# session = AiohttpSession(proxy=config.PROXY_URL, timeout=config.REQUEST_TIMEOUT)
+# NEW: Глобально отключаем превью ссылок во ВСЕХ сообщениях (send_message и edit_text),
+# включая пуши, сводку и редактирование при пагинации. Тумблер — DISABLE_LINK_PREVIEW в config.py.
+bot = Bot(token=config.BOT_TOKEN, session=session, default=DefaultBotProperties(link_preview_is_disabled=config.DISABLE_LINK_PREVIEW))
 dp = Dispatcher()
 
 # Абсолютный путь к файлу настроек (защита от потери при запуске из другой директории)
@@ -222,7 +230,8 @@ async def safe_edit(callback: CallbackQuery, text: Optional[str] = None, reply_m
 # --- КЛАВИАТУРЫ ---
 def main_menu_kb() -> ReplyKeyboardMarkup:
     """Создает главную клавиатуру (Reply), скрывая кнопки отключенных источников."""
-    kb = [[KeyboardButton(text="📅 Дедлайны")]]
+    # Тексты берутся из config.py
+    kb = [[KeyboardButton(text=config.BTN_DEADLINES)]]
     # ---
     # Группировка кнопок источников в один ряд
     # row = [KeyboardButton(text=btn_text) for btn_text, src_key in SOURCE_BUTTONS.items() if config.SOURCES.get(src_key, {}).get("enabled")]
@@ -235,17 +244,19 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     for i in range(0, len(src_buttons), 3):
         kb.append(src_buttons[i:i+3])
     # ---
-    kb.append([KeyboardButton(text="⚙️ Настройки")])
+    kb.append([KeyboardButton(text=config.BTN_SETTINGS)])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def settings_menu_kb() -> ReplyKeyboardMarkup:
     """Создает клавиатуру меню настроек (Reply)."""
+    # CHANGED: Тексты берутся из config.py, а кнопки источников генерируются автоматически
     kb = [
-        [KeyboardButton(text="🛎️ Уведомления"), KeyboardButton(text="📅 Дедлайны")],
-        [KeyboardButton(text="📋 Kanban"), KeyboardButton(text="📁 Projects"), KeyboardButton(text="📝 Tasks/Todo")],
-        [KeyboardButton(text="⚙️ Дополнительные настройки")],
-        [KeyboardButton(text="🏠 В главное меню")]
+        [KeyboardButton(text=config.BTN_NOTIFY), KeyboardButton(text=config.BTN_DEADLINES)],
+        [KeyboardButton(text=btn_text) for btn_text, src_key in SOURCE_BUTTONS.items() if config.SOURCES.get(src_key, {}).get("enabled")],
+        [KeyboardButton(text=config.BTN_EXTRA_SETTINGS)],
+        [KeyboardButton(text=config.BTN_MAIN_MENU)]
     ]
+    kb = [row for row in kb if row]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def upcoming_kb(period, page, total_count, limit=config.PAGINATION_LIMIT) -> InlineKeyboardMarkup:
@@ -459,6 +470,18 @@ def format_note_card(note: Dict[str, Any], show_source: bool = False) -> str:
     text = text.rstrip(' \n') + "\n" + "⠀" * 60
     return f"<blockquote>{text}</blockquote>\n"
 
+
+# Карточка для пуша по подзадаче (карточке Kanban / чекбоксу). В компактном
+# режиме (NOTIFY_CARD_ONLY в конфиге) — только файл и дата, без тела всей заметки/борды.
+def _task_notify_card(note: Dict[str, Any], task_text: Optional[str], due_dt: datetime) -> str:
+    if task_text and config.NOTIFY_CARD_ONLY:
+        text = f"{CARD_ICON} <b>{html.escape(str(note['filename']))}</b>\n📅 {due_dt.strftime('%d.%m.%Y %H:%M')}\n"
+        # Трюк для растягения blockquote на всю ширину (60 невидимых символов)
+        text = text.rstrip(' \n') + "\n" + "⠀" * 60
+        return f"<blockquote>{text}</blockquote>\n"
+    return format_note_card(note)
+
+
 # --- ПЛАНИРОВЩИК И УВЕДОМЛЕНИЯ ---
 async def check_and_notify():
     """Фоновая задача планировщика (APScheduler). Запускается каждую минуту."""
@@ -486,7 +509,8 @@ async def check_and_notify():
                 for t in note['tasks']:
                     if t['due'] and not t['done']:
                         logging.debug(f"[ПЛАНИРОВЩИК] Проверка подзадачи '{t['text']}'. Дедлайн: {t['due']}")
-                        await process_due(user_id, settings, t['due'], note, t['text'])
+                        # Передаем колонку канбан-карточки отдельным параметром
+                        await process_due(user_id, settings, t['due'], note, t['text'], t.get('column'))
         except Exception as e:
             logging.error(f"[КРИТИЧЕСКАЯ ОШИБКА] Ошибка нотификации: {e}", exc_info=True)
 
@@ -520,7 +544,15 @@ async def send_daily_digest():
         if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
 
         due = utils.get_note_due(n)
-        if due != datetime.max and start_of_today <= due <= end_of_today:
+        # CHANGED: Проверяем не только дедлайн заметки, но и подзадачи (карточки Kanban / чекбоксы):
+        # иначе задача на сегодня не попадет в сводку, если у заметки/борды есть более ранняя дата.
+        in_window = due != datetime.max and start_of_today <= due <= end_of_today
+        if not in_window:
+            in_window = any(
+                t['due'] and not t['done'] and start_of_today <= t['due'] <= end_of_today
+                for t in n.get('tasks', [])
+            )
+        if in_window:
             if n['filename'] not in notes_set:
                 notes_set.add(n['filename'])
                 all_notes.append(n)
@@ -545,7 +577,7 @@ async def send_daily_digest():
     except Exception as e:
         logging.error(f"[ОШИБКА ОТПРАВКИ] Не удалось отправить сводку: {e}")
 
-async def process_due(user_id, settings, due_dt, note, task_text=None):
+async def process_due(user_id, settings, due_dt, note, task_text=None, task_column=None):
     """Сравнивает время дедлайна с текущим временем и отправляет уведомления с учетом Grace Window (2 мин)."""
     if not isinstance(settings.get("notified_tasks"), set):
         settings["notified_tasks"] = set(settings.get("notified_tasks") or [])
@@ -579,8 +611,13 @@ async def process_due(user_id, settings, due_dt, note, task_text=None):
             if notify_key not in settings["notified_tasks"]:
                 logging.info(f"[УВЕДОМЛЕНИЕ] Срабатывание интервала -{interval} мин. Ключ: {notify_key}")
                 msg = f"⏰ <b>Напоминание (-{interval} мин)!</b>\n"
-                if task_text: msg += f"Задача: {task_text}\n"
-                msg += format_note_card(note)
+                # Экранируем текст задачи (HTML) — карточки с <, >, & раньше ломали отправку пуша.
+                # Колонка канбана рендерится в заголовке из технического поля задачи (текст чист от рождения)
+                if task_text:
+                    col_prefix = f"[{html.escape(task_column)}] " if task_column else ""
+                    msg += f"Задача: {col_prefix}{html.escape(task_text)}\n"
+                # Компактный режим пуша по задаче (NOTIFY_CARD_ONLY) или полная карточка заметки
+                msg += _task_notify_card(note, task_text, due_dt)
                 try:
                     await bot.send_message(user_id, msg, parse_mode="HTML", disable_notification=disable_notif)
                     settings["notified_tasks"].add(notify_key)
@@ -598,8 +635,13 @@ async def process_due(user_id, settings, due_dt, note, task_text=None):
         if notify_key not in settings["notified_tasks"]:
             logging.info(f"[УВЕДОМЛЕНИЕ] Срабатывание 'В момент начала'. Ключ: {notify_key}")
             msg = f"🚨 <b>ПРЯМО СЕЙЧАС!</b>\n"
-            if task_text: msg += f"Задача: {task_text}\n"
-            msg += format_note_card(note)
+            # Экранируем текст задачи (HTML) — карточки с <, >, & раньше ломали отправку пуша.
+            # Колонка канбана рендерится в заголовке из технического поля задачи (текст чист от рождения)
+            if task_text:
+                col_prefix = f"[{html.escape(task_column)}] " if task_column else ""
+                msg += f"Задача: {col_prefix}{html.escape(task_text)}\n"
+            # Компактный режим пуша по задаче (NOTIFY_CARD_ONLY) или полная карточка заметки
+            msg += _task_notify_card(note, task_text, due_dt)
             try:
                 await bot.send_message(user_id, msg, parse_mode="HTML", disable_notification=disable_notif)
                 settings["notified_tasks"].add(notify_key)
@@ -668,6 +710,3 @@ async def main():
             observer.stop()
             observer.join()
         await bot.session.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())

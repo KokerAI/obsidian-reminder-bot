@@ -45,6 +45,11 @@ if config.ENABLE_DATAVIEW:
 # Голая дата (строго в конце строки)
 if config.ENABLE_BARE_DATES:
     _task_date_regexes.append(re.compile(rf'(?P<date>{_date_part})\s*$'))
+# Даты Kanban-плагина: нативный маркер "@{дата}" / "@{дата время}" (пару
+# "@{дата} @@{время}" сливает _process_kanban_body). Позиция в строке любая,
+# как у эмодзи-маркера Tasks. Хвостовые ⏫/теги/`` дедлайн не отрезают.
+if config.ENABLE_KANBAN_DATES:
+    _task_date_regexes.append(re.compile(rf'@\{{\s*(?P<date>{_date_part})\s*\}}'))
 
 # Паттерны классификации строк
 _CHECKBOX_LINE = re.compile(r'^\s*[-*+]\s*\[(?P<status>[ xX])\]\s*(?P<rest>.*)$')
@@ -115,9 +120,10 @@ def _process_kanban_body(body: str) -> str:
     valid_indices = [i for i in [cut_idx_1, cut_idx_2] if i > 0]
     if valid_indices: body = body[:min(valid_indices)].strip()
 
-    # ИСПРАВЛЕНО: Убрана мертвая переменная is_done_column, инициализация в одну строку
     new_lines, skip_next_empty = [], False
-    current_col = "" # НОВОЕ: Переменная для хранения имени текущей колонки
+
+    # "Сегодня" для привязки "@@{время}" без даты к текущему дню (режим ENABLE_KANBAN_TIME_ONLY)
+    today_str = utils.get_now().strftime("%Y-%m-%d") if config.ENABLE_KANBAN_TIME_ONLY else ""
 
     for l in body.splitlines():
         if skip_next_empty and not l.strip():
@@ -128,7 +134,7 @@ def _process_kanban_body(body: str) -> str:
         # Колонки
         if l.startswith("## "):
             col_name = l[3:].strip()
-            current_col = col_name # НОВОЕ: Запоминаем колонку
+
             done_markers = ["done", "archive", "complete", "completed", "завершено", "выполнено", "архив"]
             if any(m in col_name.lower() for m in done_markers): l = l.rstrip() + " ✓"
             new_lines.append(l)
@@ -157,8 +163,29 @@ def _process_kanban_body(body: str) -> str:
             if "**complete**" in text.lower():
                 text = re.sub(r'\*\*[Cc]omplete\*\*', '', text, flags=re.IGNORECASE).strip()
                 if " ✓" not in text: text += " ✓"
+            # NEW: Даты Kanban-плагина — нативный маркер "@{дата}" (regex в _task_date_regexes).
+            # Сначала нормализуем пробел между "@"/"@@" и "{" (ручной ввод " @ {…}"),
+            # затем пару "@{дата} @@{время}" сливаем в один маркер "@{дата время}".
+            # Часы строго 2 цифры (формат плагина HH:mm). Маркер парсится в любом
+            # месте строки, поэтому хвостовые ⏫/теги/`` не отрезают дедлайн.
+            if config.ENABLE_KANBAN_DATES:
+                text = re.sub(r'(@+)\s+\{', r'\1{', text)
+                text = re.sub(
+                    rf'@\{{\s*({_date_part})\s*\}}\s*@@\{{\s*(\d{{2}}(?:{_time_sep_pattern}\d{{2}})?)\s*\}}',
+                    r'@{\1 \2}',
+                    text
+                )
+            # NEW: "@@{время}" без даты — привязываем время к текущему дню (тумблер в
+            # конфиге, по умолчанию ВЫКЛ; работает только при ENABLE_KANBAN_DATES).
+            # Только если в строке нет другой даты дедлайна — маркера "@{…}" или эмодзи
+            # Tasks, иначе из одной карточки вышло бы две задачи.
+            if config.ENABLE_KANBAN_DATES and config.ENABLE_KANBAN_TIME_ONLY and not re.search(r'(?<!@)@\{', text) and not any(ic in text for ic in config.TASKS_DUE_EMOJI):
+                text = re.sub(rf'@@\{{\s*(\d{{2}}(?:{_time_sep_pattern}\d{{2}})?)\s*\}}', rf'@{{{today_str} \1}}', text)
+            # CHANGED: (?<!@) защищает нативные маркеры "@{…}"/"@@{…}" от разворачивания
+            # скобок — без него стрипер съедал их и дедлайн терялся. Остальные случаи
+            # (эмодзи+скобки, обычные скобки) обрабатываются как раньше.
             text = re.sub(
-                r'([^\w\[\]\{\}\(\)]*)\s*[\{\(]([^}\)]*\d[^}\)]*)[\}\)]',
+                r'([^\w\[\]\{\}\(\)]*)\s*(?<!@)[\{\(]([^}\)]*\d[^}\)]*)[\}\)]',
                 lambda match: f" {match.group(1).strip()} {match.group(2)} " if match.group(1).strip() in config.TASKS_DUE_EMOJI else f" {match.group(2)} ",
                 text
             )
@@ -166,10 +193,6 @@ def _process_kanban_body(body: str) -> str:
             text = re.sub(r'(?<=\d)\s*([\-./:])\s*(?=\d)', r'\1', text)
             # Схлопываем только горизонтальные пробелы (сохраняя переносы строк и пустые чекбоксы)
             text = re.sub(r'[ \t]{2,}', ' ', text).strip()
-
-            # НОВОЕ: Добавляем имя колонки в начало текста карточки, чтобы бот выводил его в Telegram
-            if current_col:
-                text = f"[{current_col}] {text}"
 
             is_checked = '[x]' in existing_cb.lower()
             l = f"- {'[x]' if is_checked else '[ ]'} {text}"
@@ -216,7 +239,10 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
     for md_file in search_path.rglob("*.md"):
         if ".obsidian" in md_file.parts or ".trash" in md_file.parts: continue
         try:
-            content = md_file.read_text(encoding="utf-8")
+            # CHANGED: utf-8-sig срезает BOM в начале файла, если он есть; обычные UTF-8
+            # файлы читаются без изменений. Без этого frontmatter файла с BOM молча
+            # не распознавался (строка начиналась с \ufeff, а не с '---')
+            content = md_file.read_text(encoding="utf-8-sig")
             metadata = {}
             body = content
 
@@ -227,7 +253,10 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
                     yaml_block = content[3:end_fm]
                     body = content[end_fm + 3:].strip()
                     try: metadata = yaml.safe_load(yaml_block) or {}
-                    except yaml.YAMLError: pass
+                    # NEW: Раньше ошибка YAML глоталась молча: заметка/борда теряла весь
+                    # frontmatter (kanban-plugin, due, status) без единого следа в логах
+                    except yaml.YAMLError as e:
+                        logging.error(f"[PARSER] YAML не спарсился в {md_file.name}: {e}")
 
                     # ИСПРАВЛЕНО: Защита от YAML, который не является словарем (например, просто строка или список)
                     if not isinstance(metadata, dict):
@@ -276,7 +305,15 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
 
             # Инлайн-задачи
             parsed_tasks = []
+            # Для канбан-борд отслеживаем текущую колонку по заголовкам "## " тела —
+            # колонка хранится как техническое поле задачи, в текст карточки не вшивается
+            current_col = None
             for line in body.splitlines():
+                # NEW: Заголовок борды — запоминаем колонку, строку не парсим как задачу
+                # (маркер done-колонок " ✓" в имя колонки не включаем)
+                if has_kanban_plugin and line.startswith("## "):
+                    current_col = re.sub(r'\s*✓\s*$', '', line[3:].strip()) or None
+                    continue
                 classified = _classify_line(line)
                 if not classified: continue
                 kind, status_mark, rest = classified
@@ -293,7 +330,8 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
                             "text": task_text,
                             "due": task_due,
                             "due_str": task_due.strftime("%d.%m %H:%M") if task_due else "",
-                            "done": kind == "checkbox" and (status_mark or "").lower() == "x"
+                            "done": kind == "checkbox" and (status_mark or "").lower() == "x",
+                            "column": current_col # NEW: колонка канбан-карточки (для задач из обычных заметок — None)
                         })
                         matched_spans.append((match_start, match_end))
 
@@ -335,22 +373,14 @@ def get_upcoming_notes(max_date: datetime = None) -> list:
     if max_date is None: max_date = now + timedelta(days=1)
     active_sources = [key for key, val in config.SOURCES.items() if val.get("enabled")]
     for src in active_sources:
-        # Если источник Projects, ищем во всех его подпапках
-        if src == 'projects':
-            for proj in get_projects_list():
-                for n in get_notes(source=src, project_name=proj):
-                    # Фильтр скрытия выполненных задач
-                    if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
-                    if n['due'] and now <= n['due'] <= max_date: upcoming.append(n); continue
-                    for t in n['tasks']:
-                        if t['due'] and not t['done'] and now <= t['due'] <= max_date: upcoming.append(n); break
-        else:
-            for n in get_notes(source=src):
-                # Фильтр скрытия выполненных задач
-                if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
-                if n['due'] and now <= n['due'] <= max_date: upcoming.append(n); continue
-                for t in n['tasks']:
-                    if t['due'] and not t['done'] and now <= t['due'] <= max_date: upcoming.append(n); break
+        # FIX: Сканируем всю папку источника (включая корень и подпапки) одним вызовом.
+        # Ранее для Projects сканировались только подпапки, из-за чего заметки в корне Projects игнорировались.
+        for n in get_notes(source=src):
+            # Фильтр скрытия выполненных задач
+            if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
+            if n['due'] and now <= n['due'] <= max_date: upcoming.append(n); continue
+            for t in n['tasks']:
+                if t['due'] and not t['done'] and now <= t['due'] <= max_date: upcoming.append(n); break
     return upcoming
 
 def get_overdue_notes() -> list:
@@ -360,30 +390,21 @@ def get_overdue_notes() -> list:
     min_date = now - timedelta(days=getattr(config, 'OVERDUE_DAYS_LIMIT', 30))
     active_sources = [key for key, val in config.SOURCES.items() if val.get("enabled")]
     for src in active_sources:
-        # Если источник Projects, ищем во всех его подпапках
-        if src == 'projects':
-            for proj in get_projects_list():
-                for n in get_notes(source=src, project_name=proj):
-                    # Фильтр скрытия выполненных задач
-                    if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
-                    if n['due'] and min_date <= n['due'] < now: overdue.append(n); continue
-                    for t in n['tasks']:
-                        if t['due'] and not t['done'] and min_date <= t['due'] < now: overdue.append(n); break
-        else:
-            for n in get_notes(source=src):
-                # Фильтр скрытия выполненных задач
-                if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
-                # Проверяем основной дедлайн заметки (включая Fallback)
-                if n['due'] and min_date <= n['due'] < now:
-                    overdue.append(n)
-                    continue
+        # FIX: Сканируем всю папку источника (включая корень и подпапки) одним вызовом.
+        for n in get_notes(source=src):
+            # Фильтр скрытия выполненных задач
+            if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
+            # Проверяем основной дедлайн заметки (включая Fallback)
+            if n['due'] and min_date <= n['due'] < now:
+                overdue.append(n)
+                continue
 
-                # Если основного дедлайна нет (или он не просрочен), жестко проверяем подзадачи
-                # (Этот цикл теперь правильно находится внутри цикла for n)
-                for t in n['tasks']:
-                    if t['due'] and not t['done'] and min_date <= t['due'] < now:
-                        overdue.append(n)
-                        break
+            # Если основного дедлайна нет (или он не просрочен), жестко проверяем подзадачи
+            # (Этот цикл теперь правильно находится внутри цикла for n)
+            for t in n['tasks']:
+                if t['due'] and not t['done'] and min_date <= t['due'] < now:
+                    overdue.append(n)
+                    break
     return overdue
 
 def get_active_notes_for_notify(use_cache: bool = True) -> list:
@@ -394,22 +415,13 @@ def get_active_notes_for_notify(use_cache: bool = True) -> list:
     notes = []
     active_sources = [key for key, val in config.SOURCES.items() if val.get("enabled")]
     for src in active_sources:
-        # ИЗМЕНЕНО: Если источник Projects, ищем во всех его подпапках
-        if src == 'projects':
-            for proj in get_projects_list():
-                for n in get_notes(source=src, project_name=proj):
-                    if config.ACTIVE_STATUSES:
-                        if n['status'] not in config.ACTIVE_STATUSES: continue
-                    else:
-                        if n['status'] in INACTIVE_STATUSES: continue
-                    if n['due'] or any(t['due'] for t in n['tasks'] if not t['done']): notes.append(n)
-        else:
-            for n in get_notes(source=src):
-                if config.ACTIVE_STATUSES:
-                    if n['status'] not in config.ACTIVE_STATUSES: continue
-                else:
-                    if n['status'] in INACTIVE_STATUSES: continue
-                if n['due'] or any(t['due'] for t in n['tasks'] if not t['done']): notes.append(n)
+        # Сканируем всю папку источника (включая корень и подпапки) одним вызовом.
+        for n in get_notes(source=src):
+            if config.ACTIVE_STATUSES:
+                if n['status'] not in config.ACTIVE_STATUSES: continue
+            else:
+                if n['status'] in INACTIVE_STATUSES: continue
+            if n['due'] or any(t['due'] for t in n['tasks'] if not t['done']): notes.append(n)
     _notify_cache["last_fetch"] = now
     _notify_cache["data"] = notes
     return notes

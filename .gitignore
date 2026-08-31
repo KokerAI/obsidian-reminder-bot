@@ -3,6 +3,8 @@ venv/
 .venv/
 env/
 ENV/
+.venv_linux/
+.venv_windows/
 
 # --- Кэш Python и скомпилированные файлы ---
 __pycache__/
@@ -17,6 +19,9 @@ __pycache__/
 *.env
 # Файл с настройками бота и логом отправленных уведомлений
 settings.json
+# Временные файлы атомарной записи и бэкапы
+*.tmp
+*.corrupted_backup
 
 # --- Логи ---
 *.log

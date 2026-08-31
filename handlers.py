@@ -23,6 +23,10 @@ from bot import (
 
 router = Router()
 
+# Словарь для отслеживания активной Reply-клавиатуры (main/settings).
+# Решает конфликт одинаковых текстов кнопок в разных меню без FSM.
+user_menus = {}
+
 
 # ==============================================================================
 # 1. ХЭНДЛЕРЫ БАЗОВЫХ КОМАНД
@@ -34,6 +38,7 @@ async def cmd_start(message: Message):
     if uid not in user_settings: user_settings[uid] = default_settings()
     else: user_settings[uid]["is_active"] = True
     save_user_settings()
+    user_menus[uid] = "main" # NEW: Фиксируем активное меню
     await message.answer("Привет! Я бот для Obsidian. Выбери статус задач внизу:", reply_markup=main_menu_kb())
 
 
@@ -50,52 +55,35 @@ async def cmd_stop(message: Message):
 @router.message(Command("menu"))
 async def cmd_menu(message: Message):
     """Открывает главное меню."""
+    user_menus[message.from_user.id] = "main" # NEW: Фиксируем активное меню
     await message.answer("🏠 Главное меню:", reply_markup=main_menu_kb())
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     """Выводит справку по доступным командам."""
-    await message.answer("ℹ️ <b>Справка по боту</b>\n\nЯ читаю твои заметки из папок Tasks и присылаю уведомления о дедлайнах.\n\nДоступные команды:\n/start - Запустить бота / включить уведомления\n/stop - Временно выключить уведомления\n/menu - Открыть главное меню\n/help - Показать эту справку")
+    await message.answer("ℹ️ <b>Справка по боту</b>\n\nЯ читаю твои заметки из папок Tasks и присылаю уведомления о дедлайнах.\n\nДоступные команды:\n/start - Запустить бота / включить уведомления\n/stop - Временно выключить уведомления\n/menu - Открыть главное меню\n/help - Показать эту справку", parse_mode="HTML")
 
 
 # ==============================================================================
 # 2. ХЭНДЛЕРЫ НАСТРОЕК
 # ==============================================================================
-@router.message(F.text == "⚙️ Настройки")
+# Используем переменные из config.py для текстов кнопок
+@router.message(F.text == config.BTN_SETTINGS)
 async def open_settings(message: Message):
     """Открывает меню настроек (Reply клавиатура)."""
+    user_menus[message.from_user.id] = "settings" # NEW: Фиксируем активное меню
     await message.answer("⚙️ <b>Настройки</b>\nВыберите раздел:", reply_markup=settings_menu_kb(), parse_mode="HTML")
 
 
-@router.message(F.text == "📅 Дедлайны")
-async def open_display_settings_msg(message: Message):
-    """Открывает меню настроек отображения из главного меню настроек."""
-    await message.answer("📅 <b>Дедлайны</b>\n\nВыбери, как выводить дедлайны:", reply_markup=display_settings_kb(message.from_user.id), parse_mode="HTML")
-
-@router.message(F.text == "📋 Kanban")
-async def open_kanban_settings(message: Message):
-    """Открывает меню настроек Kanban."""
-    await message.answer("📋 <b>Настройки Kanban</b>\n\nВыбери, как выводить доски и заметки:", reply_markup=kanban_settings_kb(message.from_user.id), parse_mode="HTML")
-
-@router.message(F.text == "📝 Tasks/Todo")
-async def open_tasks_settings(message: Message):
-    """Открывает меню настроек Tasks."""
-    await message.answer("📝 <b>Настройки Tasks/Todo</b>\n\nВыбери, как выводить задачи:", reply_markup=tasks_settings_kb(message.from_user.id), parse_mode="HTML")
-
-@router.message(F.text == "📁 Projects")
-async def open_projects_settings(message: Message):
-    """Открывает меню настроек Projects."""
-    await message.answer("📁 <b>Настройки Projects</b>\n\nВыбери, как выводить проекты:", reply_markup=projects_settings_kb(message.from_user.id), parse_mode="HTML")
-
-@router.message(F.text == "🛎️ Уведомления")
+@router.message(F.text == config.BTN_NOTIFY)
 async def show_notify_settings(message: Message):
     """Открывает inline-меню настройки интервалов уведомлений."""
     if message.from_user.id not in user_settings: user_settings[message.from_user.id] = default_settings()
     await message.answer("⏳ <b>Настройки уведомлений</b>\n\nВыбери, за сколько предупреждать о дедлайне.\n✅ — включено\n❌ — выключено", reply_markup=settings_kb(message.from_user.id), parse_mode="HTML")
 
 # Открытие дополнительных настроек
-@router.message(F.text == "⚙️ Дополнительные настройки")
+@router.message(F.text == config.BTN_EXTRA_SETTINGS)
 async def open_extra_settings(message: Message):
     """Открывает меню дополнительных настроек."""
     await message.answer("⚙️ <b>Дополнительные настройки</b>\n\nУправление режимами бота:", reply_markup=extra_settings_kb(message.from_user.id), parse_mode="HTML")
@@ -103,15 +91,17 @@ async def open_extra_settings(message: Message):
 @router.callback_query(F.data == "back_to_settings_menu")
 async def back_to_settings_menu(callback: CallbackQuery):
     """Возвращает из inline-настроек в меню настроек (Reply)."""
+    user_menus[callback.from_user.id] = "settings" # NEW: Фиксируем активное меню
     try: await callback.message.delete()
     except TelegramBadRequest: pass
     await callback.message.answer("⚙️ <b>Настройки</b>\nВыберите раздел:", reply_markup=settings_menu_kb(), parse_mode="HTML")
     await callback.answer()
 
 
-@router.message(F.text == "🏠 В главное меню")
+@router.message(F.text == config.BTN_MAIN_MENU)
 async def back_to_main_menu(message: Message):
     """Возвращает из меню настроек в главное меню."""
+    user_menus[message.from_user.id] = "main" # NEW: Фиксируем активное меню
     await message.answer("🏠 Главное меню:", reply_markup=main_menu_kb())
 
 
@@ -266,10 +256,17 @@ async def set_projects_sort_dir(callback: CallbackQuery):
 # ==============================================================================
 # 4. ХЭНДЛЕРЫ ДЕДЛАЙНОВ И РЕНДЕР
 # ==============================================================================
-@router.message(F.text == "📅 Дедлайны")
-async def show_upcoming_msg(message: Message):
-    """Выводит дедлайны за 1 день (по кнопке Reply-клавиатуры)."""
-    await render_upcoming(message, "1", 0, is_callback=False)
+# Используем переменную из config.py
+@router.message(F.text == config.BTN_DEADLINES)
+async def handle_deadlines_msg(message: Message):
+    """Обрабатывает кнопку '📅 Дедлайны' в зависимости от текущего меню (Конфликт-фри)."""
+    uid = message.from_user.id
+    if user_menus.get(uid) == "settings":
+        # Если нажато из меню настроек, открываем настройки отображения
+        await message.answer("📅 <b>Настройки дедлайнов</b>\n\nВыбери, как выводить дедлайны:", reply_markup=display_settings_kb(uid), parse_mode="HTML")
+    else:
+        # По умолчанию (из главного меню) выводим список
+        await render_upcoming(message, "1", 0, is_callback=False)
 
 
 @router.callback_query(F.data.startswith("up|"))
@@ -377,10 +374,24 @@ async def render_upcoming(event, period: str, page: int, is_callback: bool):
 # ==============================================================================
 # 5. ХЭНДЛЕРЫ ЗАДАЧ И РЕНДЕР СПИСКОВ
 # ==============================================================================
+# Унифицирована логика кнопок Kanban/Projects/Tasks с учетом текущего меню (как в Дедлайнах)
 @router.message(F.text.in_(SOURCE_BUTTONS.keys()))
 async def show_source_list(message: Message):
-    """Выводит список по кнопке источника (Kanban, Tasks, Projects)."""
+    """Выводит список по кнопке источника (Kanban, Tasks, Projects) или открывает настройки, если мы в меню настроек."""
+    uid = message.from_user.id
     source = SOURCE_BUTTONS[message.text]
+
+    # Если кнопка нажата из меню настроек, открываем соответствующие настройки
+    if user_menus.get(uid) == "settings":
+        if source == 'kanban':
+            await message.answer("📋 <b>Настройки Kanban</b>\n\nВыбери, как выводить доски и заметки:", reply_markup=kanban_settings_kb(uid), parse_mode="HTML")
+        elif source == 'tasks':
+            await message.answer("📝 <b>Настройки Tasks/Todo</b>\n\nВыбери, как выводить задачи:", reply_markup=tasks_settings_kb(uid), parse_mode="HTML")
+        elif source == 'projects':
+            await message.answer("📁 <b>Настройки Projects</b>\n\nВыбери, как выводить проекты:", reply_markup=projects_settings_kb(uid), parse_mode="HTML")
+        return
+
+    # По умолчанию (из главного меню) выводим список
     if source == 'projects':
         # Сканируем папку Projects
         projects = vault.get_projects_list()
