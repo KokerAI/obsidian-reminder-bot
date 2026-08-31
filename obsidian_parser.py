@@ -121,7 +121,7 @@ def _process_kanban_body(body: str) -> str:
     if valid_indices: body = body[:min(valid_indices)].strip()
 
     new_lines, skip_next_empty = [], False
-    current_col = "" # НОВОЕ: Переменная для хранения имени текущей колонки
+
     # "Сегодня" для привязки "@@{время}" без даты к текущему дню (режим ENABLE_KANBAN_TIME_ONLY)
     today_str = utils.get_now().strftime("%Y-%m-%d") if config.ENABLE_KANBAN_TIME_ONLY else ""
 
@@ -134,7 +134,7 @@ def _process_kanban_body(body: str) -> str:
         # Колонки
         if l.startswith("## "):
             col_name = l[3:].strip()
-            current_col = col_name # НОВОЕ: Запоминаем колонку
+
             done_markers = ["done", "archive", "complete", "completed", "завершено", "выполнено", "архив"]
             if any(m in col_name.lower() for m in done_markers): l = l.rstrip() + " ✓"
             new_lines.append(l)
@@ -193,10 +193,6 @@ def _process_kanban_body(body: str) -> str:
             text = re.sub(r'(?<=\d)\s*([\-./:])\s*(?=\d)', r'\1', text)
             # Схлопываем только горизонтальные пробелы (сохраняя переносы строк и пустые чекбоксы)
             text = re.sub(r'[ \t]{2,}', ' ', text).strip()
-
-            # НОВОЕ: Добавляем имя колонки в начало текста карточки, чтобы бот выводил его в Telegram
-            if current_col:
-                text = f"[{current_col}] {text}"
 
             is_checked = '[x]' in existing_cb.lower()
             l = f"- {'[x]' if is_checked else '[ ]'} {text}"
@@ -309,7 +305,15 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
 
             # Инлайн-задачи
             parsed_tasks = []
+            # Для канбан-борд отслеживаем текущую колонку по заголовкам "## " тела —
+            # колонка хранится как техническое поле задачи, в текст карточки не вшивается
+            current_col = None
             for line in body.splitlines():
+                # NEW: Заголовок борды — запоминаем колонку, строку не парсим как задачу
+                # (маркер done-колонок " ✓" в имя колонки не включаем)
+                if has_kanban_plugin and line.startswith("## "):
+                    current_col = re.sub(r'\s*✓\s*$', '', line[3:].strip()) or None
+                    continue
                 classified = _classify_line(line)
                 if not classified: continue
                 kind, status_mark, rest = classified
@@ -326,7 +330,8 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
                             "text": task_text,
                             "due": task_due,
                             "due_str": task_due.strftime("%d.%m %H:%M") if task_due else "",
-                            "done": kind == "checkbox" and (status_mark or "").lower() == "x"
+                            "done": kind == "checkbox" and (status_mark or "").lower() == "x",
+                            "column": current_col # NEW: колонка канбан-карточки (для задач из обычных заметок — None)
                         })
                         matched_spans.append((match_start, match_end))
 

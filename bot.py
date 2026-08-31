@@ -471,7 +471,7 @@ def format_note_card(note: Dict[str, Any], show_source: bool = False) -> str:
     return f"<blockquote>{text}</blockquote>\n"
 
 
-# NEW: Карточка для пуша по подзадаче (карточке Kanban / чекбоксу). В компактном
+# Карточка для пуша по подзадаче (карточке Kanban / чекбоксу). В компактном
 # режиме (NOTIFY_CARD_ONLY в конфиге) — только файл и дата, без тела всей заметки/борды.
 def _task_notify_card(note: Dict[str, Any], task_text: Optional[str], due_dt: datetime) -> str:
     if task_text and config.NOTIFY_CARD_ONLY:
@@ -509,7 +509,8 @@ async def check_and_notify():
                 for t in note['tasks']:
                     if t['due'] and not t['done']:
                         logging.debug(f"[ПЛАНИРОВЩИК] Проверка подзадачи '{t['text']}'. Дедлайн: {t['due']}")
-                        await process_due(user_id, settings, t['due'], note, t['text'])
+                        # Передаем колонку канбан-карточки отдельным параметром
+                        await process_due(user_id, settings, t['due'], note, t['text'], t.get('column'))
         except Exception as e:
             logging.error(f"[КРИТИЧЕСКАЯ ОШИБКА] Ошибка нотификации: {e}", exc_info=True)
 
@@ -576,7 +577,7 @@ async def send_daily_digest():
     except Exception as e:
         logging.error(f"[ОШИБКА ОТПРАВКИ] Не удалось отправить сводку: {e}")
 
-async def process_due(user_id, settings, due_dt, note, task_text=None):
+async def process_due(user_id, settings, due_dt, note, task_text=None, task_column=None):
     """Сравнивает время дедлайна с текущим временем и отправляет уведомления с учетом Grace Window (2 мин)."""
     if not isinstance(settings.get("notified_tasks"), set):
         settings["notified_tasks"] = set(settings.get("notified_tasks") or [])
@@ -610,9 +611,12 @@ async def process_due(user_id, settings, due_dt, note, task_text=None):
             if notify_key not in settings["notified_tasks"]:
                 logging.info(f"[УВЕДОМЛЕНИЕ] Срабатывание интервала -{interval} мин. Ключ: {notify_key}")
                 msg = f"⏰ <b>Напоминание (-{interval} мин)!</b>\n"
-                # CHANGED: Экранируем текст задачи (HTML) — карточки с <, >, & раньше ломали отправку пуша
-                if task_text: msg += f"Задача: {html.escape(task_text)}\n"
-                # CHANGED: Компактный режим пуша по задаче (NOTIFY_CARD_ONLY) или полная карточка заметки
+                # Экранируем текст задачи (HTML) — карточки с <, >, & раньше ломали отправку пуша.
+                # Колонка канбана рендерится в заголовке из технического поля задачи (текст чист от рождения)
+                if task_text:
+                    col_prefix = f"[{html.escape(task_column)}] " if task_column else ""
+                    msg += f"Задача: {col_prefix}{html.escape(task_text)}\n"
+                # Компактный режим пуша по задаче (NOTIFY_CARD_ONLY) или полная карточка заметки
                 msg += _task_notify_card(note, task_text, due_dt)
                 try:
                     await bot.send_message(user_id, msg, parse_mode="HTML", disable_notification=disable_notif)
@@ -631,9 +635,12 @@ async def process_due(user_id, settings, due_dt, note, task_text=None):
         if notify_key not in settings["notified_tasks"]:
             logging.info(f"[УВЕДОМЛЕНИЕ] Срабатывание 'В момент начала'. Ключ: {notify_key}")
             msg = f"🚨 <b>ПРЯМО СЕЙЧАС!</b>\n"
-            # CHANGED: Экранируем текст задачи (HTML) — карточки с <, >, & раньше ломали отправку пуша
-            if task_text: msg += f"Задача: {html.escape(task_text)}\n"
-            # CHANGED: Компактный режим пуша по задаче (NOTIFY_CARD_ONLY) или полная карточка заметки
+            # Экранируем текст задачи (HTML) — карточки с <, >, & раньше ломали отправку пуша.
+            # Колонка канбана рендерится в заголовке из технического поля задачи (текст чист от рождения)
+            if task_text:
+                col_prefix = f"[{html.escape(task_column)}] " if task_column else ""
+                msg += f"Задача: {col_prefix}{html.escape(task_text)}\n"
+            # Компактный режим пуша по задаче (NOTIFY_CARD_ONLY) или полная карточка заметки
             msg += _task_notify_card(note, task_text, due_dt)
             try:
                 await bot.send_message(user_id, msg, parse_mode="HTML", disable_notification=disable_notif)
