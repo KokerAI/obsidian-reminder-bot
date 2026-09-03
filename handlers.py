@@ -38,7 +38,7 @@ async def cmd_start(message: Message):
     if uid not in user_settings: user_settings[uid] = default_settings()
     else: user_settings[uid]["is_active"] = True
     save_user_settings()
-    user_menus[uid] = "main" # NEW: Фиксируем активное меню
+    user_menus[uid] = "main"  # Фиксируем активное меню
     await message.answer("Привет! Я бот для Obsidian. Выбери статус задач внизу:", reply_markup=main_menu_kb())
 
 
@@ -55,7 +55,7 @@ async def cmd_stop(message: Message):
 @router.message(Command("menu"))
 async def cmd_menu(message: Message):
     """Открывает главное меню."""
-    user_menus[message.from_user.id] = "main" # NEW: Фиксируем активное меню
+    user_menus[message.from_user.id] = "main"  # Фиксируем активное меню
     await message.answer("🏠 Главное меню:", reply_markup=main_menu_kb())
 
 
@@ -72,7 +72,7 @@ async def cmd_help(message: Message):
 @router.message(F.text == config.BTN_SETTINGS)
 async def open_settings(message: Message):
     """Открывает меню настроек (Reply клавиатура)."""
-    user_menus[message.from_user.id] = "settings" # NEW: Фиксируем активное меню
+    user_menus[message.from_user.id] = "settings"  # Фиксируем активное меню
     await message.answer("⚙️ <b>Настройки</b>\nВыберите раздел:", reply_markup=settings_menu_kb(), parse_mode="HTML")
 
 
@@ -91,7 +91,7 @@ async def open_extra_settings(message: Message):
 @router.callback_query(F.data == "back_to_settings_menu")
 async def back_to_settings_menu(callback: CallbackQuery):
     """Возвращает из inline-настроек в меню настроек (Reply)."""
-    user_menus[callback.from_user.id] = "settings" # NEW: Фиксируем активное меню
+    user_menus[callback.from_user.id] = "settings"  # Фиксируем активное меню
     try: await callback.message.delete()
     except TelegramBadRequest: pass
     await callback.message.answer("⚙️ <b>Настройки</b>\nВыберите раздел:", reply_markup=settings_menu_kb(), parse_mode="HTML")
@@ -101,7 +101,7 @@ async def back_to_settings_menu(callback: CallbackQuery):
 @router.message(F.text == config.BTN_MAIN_MENU)
 async def back_to_main_menu(message: Message):
     """Возвращает из меню настроек в главное меню."""
-    user_menus[message.from_user.id] = "main" # NEW: Фиксируем активное меню
+    user_menus[message.from_user.id] = "main"  # Фиксируем активное меню
     await message.answer("🏠 Главное меню:", reply_markup=main_menu_kb())
 
 
