@@ -254,7 +254,7 @@ STATUS_BUTTONS = {
         "🛠️ Doing": "Doing",
         "✅ Done": "Done"
     },
-    # ДОБАВЛЯЙ СВОИ ПРОЕКТЫ ЗДЕСЬ:
+    # ДОБАВЛЯТЬ СВОИ ПРОЕКТЫ ЗДЕСЬ:
     # Имя папки должно совпадать с ключом!
     "Task Manager": {
         "🔁 Constant": "Constant",
