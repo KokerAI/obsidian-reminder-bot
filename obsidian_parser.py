@@ -2,7 +2,7 @@
 Модуль парсинга Markdown-заметок Obsidian.
 Отвечает за чтение файлов, извлечение метаданных (YAML frontmatter),
 парсинг инлайн-задач и кэширование данных для планировщика.
-Всю логику сортировки и пагинации делегирует в bot.py / utils.py.
+Всю логику сортировки и пагинации делегирует в bot.py / utils.py / handlers.py.
 """
 import os
 import re
@@ -25,7 +25,7 @@ INACTIVE_STATUSES = config.INACTIVE_STATUSES
 _date_sep_pattern = "[" + re.escape("".join(config.DATE_DELIMITERS)) + "]"
 _time_sep_pattern = "[" + re.escape("".join(config.TIME_DELIMITERS)) + "]"
 
-# Умный паттерн: понимает годы из 2/4 цифр, дни/месяцы из 2 цифр, опциональное время
+# Умный паттерн: годы из 2/4 цифр, дни/месяцы из 2 цифр, опциональное время
 _date_part = (
     rf'\d{{2,4}}{_date_sep_pattern}\d{{2}}{_date_sep_pattern}\d{{2,4}}'
     rf'(?:[ T]\d{{2}}(?:{_time_sep_pattern}\d{{2}}(?:{_time_sep_pattern}\d{{2}})?)?)?'
@@ -45,20 +45,22 @@ if config.ENABLE_DATAVIEW:
 # Голая дата (строго в конце строки)
 if config.ENABLE_BARE_DATES:
     _task_date_regexes.append(re.compile(rf'(?P<date>{_date_part})\s*$'))
-# Даты Kanban-плагина: нативный маркер "@{дата}" / "@{дата время}" (пару
-# "@{дата} @@{время}" сливает _process_kanban_body). Позиция в строке любая,
-# как у эмодзи-маркера Tasks. Хвостовые ⏫/теги/`` дедлайн не отрезают.
+# Даты Kanban-плагина: нативный маркер "@{дата}" / "@{дата время}" (пару "@{дата} @@{время}"
+# сливает _process_kanban_body). Маркер распознается в любом месте строки (как эмодзи Tasks),
+# поэтому хвостовые приоритеты (⏫), теги и прочий текст не отрезают дедлайн.
 if config.ENABLE_KANBAN_DATES:
     _task_date_regexes.append(re.compile(rf'@\{{\s*(?P<date>{_date_part})\s*\}}'))
 
 # Паттерны классификации строк
 _CHECKBOX_LINE = re.compile(r'^\s*[-*+]\s*\[(?P<status>[ xX])\]\s*(?P<rest>.*)$')
+# Если чекбоксы включены, исключаем "[...]" из списков; если выключены —
+# строки чекбоксов проваливаются в списки/тело
 _list_cb_excl = r'(?!\[)' if config.SEARCH_CHECKBOX else ''
 _LIST_LINE = re.compile(rf'^\s*(?:[-*+]\s+{_list_cb_excl}|\d{{1,3}}[.)]\s+)\s*(?P<rest>.*)$')
 _BODY_LINE = re.compile(r'^\s*(?P<rest>\S.*)$')
 
 def _classify_line(line: str):
-    """Определяет, к какому источнику относится строка (чекбокс, список, тело)."""
+    """Определяет тип строки (чекбокс, список, тело) с учетом тумблеров SEARCH_*."""
     m = _CHECKBOX_LINE.match(line)
     if m and config.SEARCH_CHECKBOX:
         return "checkbox", m.group("status"), m.group("rest")
@@ -79,7 +81,7 @@ def clear_cache():
     _notify_cache = {"last_fetch": None, "data": []}
     logging.info("[КЭШ] Кэш планировщика сброшен.")
 
-# Генерация всех комбинаций форматов для strptime
+# Генерация всех комбинаций (формат × разделитель) для strptime
 _date_fmts = [d.join(f"%{t}" for t in df.split('%') if t) for df in config.DATE_FORMATS for d in config.DATE_DELIMITERS]
 _time_fmts = [t.join(f"%{t2}" for t2 in tf.split('%') if t2) for tf in config.TIME_FORMATS for t in config.TIME_DELIMITERS]
 _DATETIME_FORMATS = list(_date_fmts)
@@ -93,13 +95,15 @@ for df in _date_fmts:
 # ==============================================================================
 
 def get_search_path(subfolder: str) -> Path:
-    """Формирует объект Path для поиска файлов."""
+    """Формирует путь поиска: пусто — BASE_FOLDER, абсолютный путь — как есть, иначе BASE_FOLDER/subfolder."""
     if not subfolder: return Path(VAULT_PATH) / BASE_FOLDER
     if os.path.isabs(subfolder): return Path(subfolder)
     return Path(VAULT_PATH) / BASE_FOLDER / subfolder
 
 def parse_datetime(date_str) -> Optional[datetime]:
-    """Парсит строку в datetime с учетом таймзоны."""
+    """Парсит значение в naive datetime с обнуленными секундами.
+    Объекты datetime приводятся к TZ и очищаются от tzinfo, строки перебирают
+    все комбинации форматов. Возвращает None, если распознать не удалось."""
     if not date_str: return None
     if isinstance(date_str, datetime):
         if date_str.tzinfo is not None:
@@ -114,6 +118,7 @@ def parse_datetime(date_str) -> Optional[datetime]:
 
 def _process_kanban_body(body: str) -> str:
     """Очищает тело Канбан-доски от служебного кода и нормализует чекбоксы/даты."""
+    # Обрезаем служебный хвост доски: всё после разделителя "***" или блока "%% kanban"
     cut_idx_2 = body.find("%% kanban")
     match_sep = re.search(r'^\s*\*\*\*\s*$', body, re.MULTILINE)
     cut_idx_1 = match_sep.start() if match_sep else -1
@@ -131,7 +136,7 @@ def _process_kanban_body(body: str) -> str:
             continue
         skip_next_empty = False
 
-        # Колонки
+        # Заголовки колонок ("## "): к имени done-колонки добавляем маркер " ✓"
         if l.startswith("## "):
             col_name = l[3:].strip()
 
@@ -140,7 +145,7 @@ def _process_kanban_body(body: str) -> str:
             new_lines.append(l)
             continue
 
-        # Метка **Complete**
+        # Метка **Complete**: помечаем последний пункт выполненным и чистим пустой хвост колонки
         if l.strip().lower() == "**complete**":
             last_non_empty_idx = -1
             for i in range(len(new_lines) - 1, -1, -1):
@@ -155,7 +160,7 @@ def _process_kanban_body(body: str) -> str:
             skip_next_empty = True
             continue
 
-        # Карточки
+        # Карточки: нормализуем в "- [ ] текст" / "- [x] текст"
         m = re.match(r'^[ \t]*([-*+]\s+)(\[[ xX]\]\s+)?(.*)$', l)
         if m:
             existing_cb = m.group(2) or ""
@@ -163,11 +168,9 @@ def _process_kanban_body(body: str) -> str:
             if "**complete**" in text.lower():
                 text = re.sub(r'\*\*[Cc]omplete\*\*', '', text, flags=re.IGNORECASE).strip()
                 if " ✓" not in text: text += " ✓"
-            # NEW: Даты Kanban-плагина — нативный маркер "@{дата}" (regex в _task_date_regexes).
-            # Сначала нормализуем пробел между "@"/"@@" и "{" (ручной ввод " @ {…}"),
-            # затем пару "@{дата} @@{время}" сливаем в один маркер "@{дата время}".
-            # Часы строго 2 цифры (формат плагина HH:mm). Маркер парсится в любом
-            # месте строки, поэтому хвостовые ⏫/теги/`` не отрезают дедлайн.
+            # Даты Kanban-плагина. Сначала нормализуем пробел между "@"/"@@" и "{"
+            # (ручной ввод " @ {…}"), затем пару "@{дата} @@{время}" сливаем в один
+            # маркер "@{дата время}" (часы — строго 2 цифры, формат плагина HH:mm)
             if config.ENABLE_KANBAN_DATES:
                 text = re.sub(r'(@+)\s+\{', r'\1{', text)
                 text = re.sub(
@@ -175,23 +178,22 @@ def _process_kanban_body(body: str) -> str:
                     r'@{\1 \2}',
                     text
                 )
-            # NEW: "@@{время}" без даты — привязываем время к текущему дню (тумблер в
-            # конфиге, по умолчанию ВЫКЛ; работает только при ENABLE_KANBAN_DATES).
-            # Только если в строке нет другой даты дедлайна — маркера "@{…}" или эмодзи
-            # Tasks, иначе из одной карточки вышло бы две задачи.
+            # "@@{время}" без даты: привязываем время к текущему дню. Только если в
+            # строке нет другой даты — маркера "@{…}" или эмодзи Tasks, иначе из
+            # одной карточки вышло бы две задачи
             if config.ENABLE_KANBAN_DATES and config.ENABLE_KANBAN_TIME_ONLY and not re.search(r'(?<!@)@\{', text) and not any(ic in text for ic in config.TASKS_DUE_EMOJI):
                 text = re.sub(rf'@@\{{\s*(\d{{2}}(?:{_time_sep_pattern}\d{{2}})?)\s*\}}', rf'@{{{today_str} \1}}', text)
-            # CHANGED: (?<!@) защищает нативные маркеры "@{…}"/"@@{…}" от разворачивания
-            # скобок — без него стрипер съедал их и дедлайн терялся. Остальные случаи
-            # (эмодзи+скобки, обычные скобки) обрабатываются как раньше.
+            # (?<!@) защищает нативные маркеры "@{…}"/"@@{…}" от разворачивания скобок;
+            # остальные случаи (эмодзи+скобки, обычные скобки) обрабатываются как раньше
             text = re.sub(
                 r'([^\w\[\]\{\}\(\)]*)\s*(?<!@)[\{\(]([^}\)]*\d[^}\)]*)[\}\)]',
                 lambda match: f" {match.group(1).strip()} {match.group(2)} " if match.group(1).strip() in config.TASKS_DUE_EMOJI else f" {match.group(2)} ",
                 text
             )
-            # Убираем пробелы только вокруг дат (цифра-разделитель-цифра), чтобы не ломать списки и переводы строк
+            # Пробелы вокруг разделителей дат (цифра-разделитель-цифра) убираем,
+            # остальной текст не трогаем
             text = re.sub(r'(?<=\d)\s*([\-./:])\s*(?=\d)', r'\1', text)
-            # Схлопываем только горизонтальные пробелы (сохраняя переносы строк и пустые чекбоксы)
+            # Схлопываем горизонтальные пробелы (переносы строк и одиночный пробел в "[ ]" не трогаем)
             text = re.sub(r'[ \t]{2,}', ' ', text).strip()
 
             is_checked = '[x]' in existing_cb.lower()
@@ -199,7 +201,6 @@ def _process_kanban_body(body: str) -> str:
         new_lines.append(l)
     return "\n".join(new_lines)
 
-# НОВАЯ ФУНКЦИЯ: Сканирует папку Projects и возвращает список имен подпапок
 def get_projects_list() -> list:
     """Сканирует папку Projects и возвращает список имен подпапок."""
     src_cfg = config.SOURCES.get('projects')
@@ -209,6 +210,7 @@ def get_projects_list() -> list:
 
     projects = []
     for d in search_path.iterdir():
+        # Скрытые (".", "_") папки пропускаем
         if d.is_dir() and not d.name.startswith('.') and not d.name.startswith('_'):
             projects.append(d.name)
     return sorted(projects)
@@ -217,17 +219,17 @@ def get_projects_list() -> list:
 # 3. ОСНОВНЫЕ МЕТОДЫ ПОЛУЧЕНИЯ ДАННЫХ
 # ==============================================================================
 
-# Добавлен параметр project_name
 def get_notes(status_filter: str = None, source: str = 'projects', project_name: str = None) -> list:
     """
-    Считывает и парсит файлы. Возвращает ПОЛНЫЙ список заметок без пагинации.
-    Пагинация применяется централизованно в bot.py после сортировок.
+    Считывает и парсит файлы. Возвращает ПОЛНЫЙ список заметок без пагинации
+    (пагинация применяется централизованно в handlers.py после сортировок).
+    Для Projects можно ограничиться подпапкой проекта (project_name).
     """
     notes = []
     src_cfg = config.SOURCES.get(source)
     if not src_cfg or not src_cfg.get("enabled"): return []
 
-    # Если ищем в Projects и указано имя проекта, спускаемся в подпапку
+    # В Projects при указанном проекте спускаемся в его подпапку
     if source == 'projects' and project_name:
         search_path = get_search_path(src_cfg["folder"]) / project_name
     else:
@@ -239,29 +241,30 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
     for md_file in search_path.rglob("*.md"):
         if ".obsidian" in md_file.parts or ".trash" in md_file.parts: continue
         try:
-            # CHANGED: utf-8-sig срезает BOM в начале файла, если он есть; обычные UTF-8
-            # файлы читаются без изменений. Без этого frontmatter файла с BOM молча
-            # не распознавался (строка начиналась с \ufeff, а не с '---')
+            # utf-8-sig срезает BOM в начале файла: без него frontmatter файла
+            # с BOM молча не распознавался (строка начиналась с \ufeff, а не с '---')
             content = md_file.read_text(encoding="utf-8-sig")
             metadata = {}
             body = content
 
-            # Извлекаем YAML
+            # Извлекаем YAML frontmatter
             if content.startswith('---'):
                 end_fm = content.find('---', 3)
                 if end_fm != -1:
                     yaml_block = content[3:end_fm]
                     body = content[end_fm + 3:].strip()
+                    # Ошибочный YAML логируем с именем файла; заметка продолжит
+                    # обработку без frontmatter, но не уронит парсер
                     try: metadata = yaml.safe_load(yaml_block) or {}
-                    # NEW: Раньше ошибка YAML глоталась молча: заметка/борда теряла весь
-                    # frontmatter (kanban-plugin, due, status) без единого следа в логах
                     except yaml.YAMLError as e:
                         logging.error(f"[PARSER] YAML не спарсился в {md_file.name}: {e}")
 
-                    # ИСПРАВЛЕНО: Защита от YAML, который не является словарем (например, просто строка или список)
+                    # Защита от YAML, не являющегося словарем (например, просто строка или список)
                     if not isinstance(metadata, dict):
                         metadata = {}
 
+            # Доски (kanban-plugin в YAML) попадают только в источник kanban;
+            # обычные заметки в папке Kanban — при parse_regular_notes
             has_kanban_plugin = 'kanban-plugin' in metadata
             if source == 'kanban' and not has_kanban_plugin and not src_cfg.get('parse_regular_notes', False): continue
             if source != 'kanban' and has_kanban_plugin: continue
@@ -271,7 +274,7 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
             status = status.strip().title() if isinstance(status, str) else "Backlog"
             if source == 'projects' and status_filter and status != status_filter: continue
 
-            # Даты
+            # Дедлайн и дата создания из YAML
             due_dt = None
             if config.SEARCH_PROPERTY:
                 for field in config.DUE_FIELDS:
@@ -285,7 +288,7 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
                     created_dt = parse_datetime(metadata.get(field))
                     if created_dt: break
 
-            # Теги
+            # Теги: строка оборачивается в список
             tags = metadata.get('tags', [])
             if isinstance(tags, str): tags = [tags]
             if not isinstance(tags, list): tags = []
@@ -294,7 +297,7 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
                 note_tags_lower = [str(t).lower() for t in tags]
                 if any(ignore_tag.lower() in note_tags_lower for ignore_tag in config.IGNORE_TAGS): continue
 
-            # Позиция
+            # Позиция (для базовой сортировки Projects)
             pos = metadata.get('position')
             if isinstance(pos, list): pos = pos[0] if pos else 9999
             elif pos is None: pos = 9999
@@ -303,20 +306,21 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
                 pos = int(pos_val) if pos_val.is_integer() else pos_val
             except (ValueError, TypeError): pos = 9999
 
-            # Инлайн-задачи
+            # Инлайн-задачи (чекбоксы/списки/тело с датами)
             parsed_tasks = []
             # Для канбан-борд отслеживаем текущую колонку по заголовкам "## " тела —
             # колонка хранится как техническое поле задачи, в текст карточки не вшивается
             current_col = None
             for line in body.splitlines():
-                # NEW: Заголовок борды — запоминаем колонку, строку не парсим как задачу
-                # (маркер done-колонок " ✓" в имя колонки не включаем)
+                # Заголовок борды — запоминаем колонку (маркер done-колонок " ✓" в имя
+                # колонки не включаем); сама строка не парсится как задача
                 if has_kanban_plugin and line.startswith("## "):
                     current_col = re.sub(r'\s*✓\s*$', '', line[3:].strip()) or None
                     continue
                 classified = _classify_line(line)
                 if not classified: continue
                 kind, status_mark, rest = classified
+                # Занятые интервалы дат: не даем разным маркерам создать дубли задачи из одной даты
                 matched_spans = []
 
                 for regex in _task_date_regexes:
@@ -331,15 +335,15 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
                             "due": task_due,
                             "due_str": task_due.strftime("%d.%m %H:%M") if task_due else "",
                             "done": kind == "checkbox" and (status_mark or "").lower() == "x",
-                            "column": current_col # NEW: колонка канбан-карточки (для задач из обычных заметок — None)
+                            "column": current_col  # Колонка канбан-карточки (для задач из обычных заметок — None)
                         })
                         matched_spans.append((match_start, match_end))
 
-            # Fallback дедлайна
+            # Fallback дедлайна: если в YAML нет даты, берем первую дату невыполненной
+            # подзадачи (визуальный якорь в карточке; пуши по-прежнему идут по подзадачам)
             due_is_fallback = False
             if not due_dt and parsed_tasks:
                 for t in parsed_tasks:
-                    # ИСПРАВЛЕНО: Берем дату только из невыполненной задачи
                     if t['due'] and not t['done']:
                         due_dt = t['due']
                         due_is_fallback = True
@@ -353,12 +357,11 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
                 "body": body, "tasks": parsed_tasks, "due_is_fallback": due_is_fallback,
                 "raw_metadata": metadata
             }
-            # Скрываем из Tasks только те заметки, где нет ни чекбоксов, ни даты заметки
+            # В Tasks показываем только заметки с инлайн-задачами или своей датой
             if source == 'tasks' and not note['tasks'] and not note['due']: continue
             # if source == 'tasks' and not note['tasks']: continue
             notes.append(note)
         except Exception as e:
-            # ИСПРАВЛЕНО: Используем logging вместо print
             logging.error(f"Ошибка чтения файла {md_file.name}: {e}", exc_info=True)
             continue
 
@@ -367,14 +370,13 @@ def get_notes(status_filter: str = None, source: str = 'projects', project_name:
     return notes
 
 def get_upcoming_notes(max_date: datetime = None) -> list:
-    """Собирает ближайшие события."""
+    """Собирает заметки с дедлайнами (у заметки или подзадачи) в окне [now, max_date] по всем включенным источникам."""
     upcoming = []
     now = utils.get_now()
     if max_date is None: max_date = now + timedelta(days=1)
     active_sources = [key for key, val in config.SOURCES.items() if val.get("enabled")]
     for src in active_sources:
-        # FIX: Сканируем всю папку источника (включая корень и подпапки) одним вызовом.
-        # Ранее для Projects сканировались только подпапки, из-за чего заметки в корне Projects игнорировались.
+        # Сканируем всю папку источника (корень и подпапки) одним вызовом
         for n in get_notes(source=src):
             # Фильтр скрытия выполненных задач
             if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
@@ -384,23 +386,22 @@ def get_upcoming_notes(max_date: datetime = None) -> list:
     return upcoming
 
 def get_overdue_notes() -> list:
-    """Собирает просроченные события (надежная проверка подзадач)."""
+    """Собирает заметки с просроченными дедлайнами (у заметки или подзадачи) за последние OVERDUE_DAYS_LIMIT дней."""
     overdue = []
     now = utils.get_now()
     min_date = now - timedelta(days=getattr(config, 'OVERDUE_DAYS_LIMIT', 30))
     active_sources = [key for key, val in config.SOURCES.items() if val.get("enabled")]
     for src in active_sources:
-        # FIX: Сканируем всю папку источника (включая корень и подпапки) одним вызовом.
+        # Сканируем всю папку источника (корень и подпапки) одним вызовом
         for n in get_notes(source=src):
             # Фильтр скрытия выполненных задач
             if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
-            # Проверяем основной дедлайн заметки (включая Fallback)
+            # Основной дедлайн заметки (включая fallback)
             if n['due'] and min_date <= n['due'] < now:
                 overdue.append(n)
                 continue
 
-            # Если основного дедлайна нет (или он не просрочен), жестко проверяем подзадачи
-            # (Этот цикл теперь правильно находится внутри цикла for n)
+            # Если основного дедлайна нет (или он не просрочен) — проверяем подзадачи
             for t in n['tasks']:
                 if t['due'] and not t['done'] and min_date <= t['due'] < now:
                     overdue.append(n)
@@ -408,14 +409,14 @@ def get_overdue_notes() -> list:
     return overdue
 
 def get_active_notes_for_notify(use_cache: bool = True) -> list:
-    """Возвращает заметки с активными статусами для планировщика (с кэшем)."""
+    """Возвращает заметки с активными статусами для планировщика (с кэшем на 30 сек)."""
     now = utils.get_now()
     if use_cache and _notify_cache["last_fetch"] and (now - _notify_cache["last_fetch"]).total_seconds() < 30:
         return _notify_cache["data"]
     notes = []
     active_sources = [key for key, val in config.SOURCES.items() if val.get("enabled")]
     for src in active_sources:
-        # Сканируем всю папку источника (включая корень и подпапки) одним вызовом.
+        # Сканируем всю папку источника (корень и подпапки) одним вызовом
         for n in get_notes(source=src):
             if config.ACTIVE_STATUSES:
                 if n['status'] not in config.ACTIVE_STATUSES: continue

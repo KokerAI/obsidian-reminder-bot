@@ -23,7 +23,7 @@ from bot import (
 
 router = Router()
 
-# Словарь для отслеживания активной Reply-клавиатуры (main/settings).
+# Словарь для отслеживания активной Reply-клавиатуры ("main"/"settings").
 # Решает конфликт одинаковых текстов кнопок в разных меню без FSM.
 user_menus = {}
 
@@ -259,13 +259,14 @@ async def set_projects_sort_dir(callback: CallbackQuery):
 # Используем переменную из config.py
 @router.message(F.text == config.BTN_DEADLINES)
 async def handle_deadlines_msg(message: Message):
-    """Обрабатывает кнопку '📅 Дедлайны' в зависимости от текущего меню (Конфликт-фри)."""
+    """Обрабатывает кнопку '📅 Дедлайны' с учетом активного меню: из настроек —
+    открывает настройки отображения, из главного меню — список."""
     uid = message.from_user.id
     if user_menus.get(uid) == "settings":
-        # Если нажато из меню настроек, открываем настройки отображения
+        # Нажато из меню настроек — открываем настройки отображения
         await message.answer("📅 <b>Настройки дедлайнов</b>\n\nВыбери, как выводить дедлайны:", reply_markup=display_settings_kb(uid), parse_mode="HTML")
     else:
-        # По умолчанию (из главного меню) выводим список
+        # По умолчанию (из главного меню) — выводим список
         await render_upcoming(message, "1", 0, is_callback=False)
 
 
@@ -277,13 +278,13 @@ async def show_upcoming_clb(callback: CallbackQuery):
 
 
 async def render_upcoming(event, period: str, page: int, is_callback: bool):
-    """Рендерит список дедлайнов или просроченных событий с учетом сортировок и пагинации."""
+    """Рендерит список дедлайнов (или просроченных) с учетом сортировок и пагинации."""
     limit = config.PAGINATION_LIMIT
     offset = page * limit
     now = utils.get_now()
 
     is_overdue = (str(period) == "overdue")
-    # Периоды на кнопках в дедлайнах
+    # Подписи кнопок периодов
     period_titles = {"1": "1 день", "2": "2 дня", "4": "4 дня", "7": "Неделя", "14": "2 недели", "30": "Месяц", "90": "3 месяца"}
 
     if is_overdue:
@@ -294,9 +295,8 @@ async def render_upcoming(event, period: str, page: int, is_callback: bool):
             max_date = now + timedelta(days=365 * 10)
             title_text = "📅 Все будущие"
         else:
-            # Убрано избыточное тернарное условие
             days = int(period)
-            # Если включен режим "today", сдвигаем границу до 23:59 нужного дня для всех кнопок
+            # В режиме "today" сдвигаем границу до 23:59 нужного дня для всех кнопок
             if getattr(config, 'DEADLINES_DAY_VIEW', '24h') == "today":
                 # "1 день" = сегодня (0 дней вперед), "2 дня" = завтра (1 день вперед) и т.д.
                 max_date = (now + timedelta(days=days - 1)).replace(hour=23, minute=59, second=0, microsecond=0)
@@ -308,11 +308,12 @@ async def render_upcoming(event, period: str, page: int, is_callback: bool):
     uid = event.from_user.id
     s = user_settings.get(uid, default_settings())
 
-    # Подготовка порядка источников для статической группировки
+    # Порядок источников для статической группировки
     enabled_sources = sorted([v for v in config.SOURCES.values() if v.get("enabled")], key=lambda x: x.get("order", 99))
     source_order_map = {v["name"]: v.get("order", 99) for v in enabled_sources}
 
-    # Логика сортировки. Разворачиваем весь массив, чтобы свежие/старые попадали на 1-ю страницу.
+    # Сортируем весь массив до пагинации, чтобы выбранные порядок/направление
+    # действовали с первой страницы
     sort_order = s.get("sort_order", "new")
     if is_overdue:
         # Для просроченных: new (Сначала новые) = reverse=True (вчерашние наверху), old (Сначала старые) = reverse=False (древние наверху)
@@ -374,7 +375,7 @@ async def render_upcoming(event, period: str, page: int, is_callback: bool):
 # ==============================================================================
 # 5. ХЭНДЛЕРЫ ЗАДАЧ И РЕНДЕР СПИСКОВ
 # ==============================================================================
-# Унифицирована логика кнопок Kanban/Projects/Tasks с учетом текущего меню (как в Дедлайнах)
+# Кнопки источников работают с учетом активного меню (как у Дедлайнов)
 @router.message(F.text.in_(SOURCE_BUTTONS.keys()))
 async def show_source_list(message: Message):
     """Выводит список по кнопке источника (Kanban, Tasks, Projects) или открывает настройки, если мы в меню настроек."""
@@ -433,12 +434,11 @@ async def paginate_tasks(callback: CallbackQuery):
     await render_tasks(callback, status, page, True, source=source, project_name=project_name)
 
 
-# ИЗМЕНЕНО: Добавлен параметр project_name
 async def render_tasks(event, status: str, page: int, is_callback: bool, source: str = 'projects', project_name: str = None):
-    """Рендерит список задач с учетом пагинации, источника и умной сборки текста."""
+    """Рендерит список задач с учетом пагинации, источника, проекта и настроек сортировки."""
     limit = config.PAGINATION_LIMIT
     offset = page * limit
-    # Если выбран статус "All", фильтр не применяем (показываем все)
+    # Статус "All" — без фильтра (показываем все)
     status_filter = status if source == 'projects' and status != 'All' else None
 
     # Передаем project_name в парсер
@@ -452,16 +452,17 @@ async def render_tasks(event, status: str, page: int, is_callback: bool, source:
         sort_order = s.get("kanban_sort_order", "new")
         sort_dir = s.get("kanban_sort_dir", "btt")
 
-        # ИСПРАВЛЕНО: Унифицировано с Дедлайнами. "new" = False (ближайшие внизу)
+        # Унифицировано с Дедлайнами: "new" = reverse=False (ближайшие внизу)
         reverse_base_sort = (sort_order == "old")
 
         kanban_group = s.get("kanban_primary_group", "none")
-        kanban_dynamic_sort = s.get("kanban_dynamic_sort", True)  # НОВОЕ: Читаем настройку
+        kanban_dynamic_sort = s.get("kanban_dynamic_sort", True)
 
-        # Учет настройки "С группировкой" (если включена - kanban_group != "none")
+        # Группировка включена, если kanban_group != "none"
         if kanban_group == "none":
             sorted_notes = utils.sort_notes(all_notes, reverse_base_sort=reverse_base_sort)
         else:
+            # Конфиг виртуальных групп: порядок (борды/заметки) и признак борды (kanban-plugin в YAML)
             vg_config = {
                 "group_names_order": ["Kanban Boards", "Kanban Notes"] if kanban_group == "boards_first" else ["Kanban Notes", "Kanban Boards"],
                 "key_func": lambda n: "Kanban Boards" if 'kanban-plugin' in n.get('raw_metadata', {}) else "Kanban Notes"
@@ -476,11 +477,11 @@ async def render_tasks(event, status: str, page: int, is_callback: bool, source:
     elif source == 'tasks':
         sort_order = s.get("tasks_sort_order", "new")
         sort_dir = s.get("tasks_sort_dir", "btt")
-        # Унифицировано с Дедлайнами. "new" = False (ближайшие внизу)
+        # Унифицировано с Дедлайнами: "new" = reverse=False (ближайшие внизу)
         reverse_base_sort = (sort_order == "old")
         sorted_notes = utils.sort_notes(all_notes, reverse_base_sort=reverse_base_sort)
     else:
-        # Для Projects логика сортировки аналогична дедлайнам
+        # Для Projects логика сортировки аналогична Дедлайнам
         sort_order = s.get("projects_sort_order", "new")
         sort_dir = s.get("projects_sort_dir", "btt")
         reverse_base_sort = (sort_order == "old")
@@ -488,7 +489,7 @@ async def render_tasks(event, status: str, page: int, is_callback: bool, source:
 
     notes = sorted_notes[offset: offset + limit]
 
-    # Направление списка для Kanban, Tasks и Projects
+    # Направление списка (Сверху вниз / Снизу вверх)
     if source in ['kanban', 'tasks', 'projects'] and sort_dir == "btt":
         notes.reverse()
 
@@ -496,8 +497,8 @@ async def render_tasks(event, status: str, page: int, is_callback: bool, source:
     src_name = src_cfg.get("name", source.capitalize())
     src_icon = _source_icon_for(source)
 
-    # --- УБРАНЫ ТЕКСТОВЫЕ ЯРЛЫКИ "Источник:" и "Статус:" (Эмодзи самодостаточны) ---
-    # ИЗМЕНЕНО: Заголовок для конкретного проекта
+    # Заголовок без ярлыков "Источник:"/"Статус:" — эмодзи самодостаточны.
+    # Для Projects выносим в заголовок проект и текущий статус
     if source == 'projects':
         tail = f"{_status_icon(status)}{status}" if status != 'All' else "Все"
         if project_name: tail = f"{project_name} | {tail}"
@@ -519,7 +520,7 @@ async def render_tasks(event, status: str, page: int, is_callback: bool, source:
         current_vg = None
 
         for note in notes:
-            # Рендер шапок виртуальных групп для Канбана (если не выбрано "без группировки")
+            # Шапки виртуальных групп Kanban (если группировка включена)
             if source == 'kanban' and s.get("kanban_primary_group", "none") != "none":
                 vg_name = "Kanban Boards" if 'kanban-plugin' in note.get('raw_metadata', {}) else "Kanban Notes"
                 if vg_name != current_vg:

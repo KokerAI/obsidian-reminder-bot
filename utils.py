@@ -1,6 +1,6 @@
 """
 Модуль общих утилит проекта.
-Содержит вспомогательные функции и классы для дат, логирования и централизованной сортировки,
+Содержит вспомогательные функции для дат, прокси и централизованной сортировки,
 чтобы избежать дублирования кода (DRY) и циклических зависимостей между модулями.
 """
 import os
@@ -10,20 +10,19 @@ import config
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-# NEW: Умная функция авто-определения прокси
 def get_active_proxy() -> Optional[str]:
     """
-    Умная проверка прокси.
-    1. Если PROXY_URL задан в .env — использует его (жесткий режим).
-    2. Иначе перебирает список популярных портов локальных прокси (HAPP, INCI, v2ray, Psiphon).
-       Если находит открытый порт — собирает URL из PROXY_TYPE, PROXY_USER, PROXY_PASS.
-    3. Если все порты закрыты — возвращает None (прямое соединение).
+    Автоопределение прокси:
+    1. Если PROXY_URL задан в .env — использовать его (жесткий режим).
+    2. Иначе перебрать популярные порты локальных прокси (HAPP, INCI, v2ray, Psiphon);
+       на открытом порте собрать URL из PROXY_TYPE, PROXY_USER, PROXY_PASS.
+    3. Если все порты закрыты — вернуть None (прямое соединение).
     """
     if config.PROXY_URL:
         return config.PROXY_URL
 
     host = "127.0.0.1"
-    # Список популярных портов для локальных VPN-клиентов
+    # Популярные порты локальных VPN-клиентов
     ports_to_check = [10808, 10809, 12334, 1080, 8080]
 
     proxy_type = os.getenv("PROXY_TYPE", "socks5").lower()
@@ -33,19 +32,19 @@ def get_active_proxy() -> Optional[str]:
     for port in ports_to_check:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1) # Ждем ответа 1 секунду
+                s.settimeout(1)  # Таймаут проверки порта — 1 секунда
                 if s.connect_ex((host, port)) == 0:
                     logging.info(f"[Utils] Порт {port} открыт. Включаю прокси.")
 
-                    # Если есть логин и пароль, склеиваем с ними
+                    # С логином и паролем
                     if proxy_user and proxy_pass:
                         return f"{proxy_type}://{proxy_user}:{proxy_pass}@{host}:{port}"
-                    # Если пароля нет, склеиваем без него
+                    # Без авторизации
                     else:
                         return f"{proxy_type}://{host}:{port}"
         except Exception as e:
             logging.error(f"[Utils] Ошибка при проверке порта {port}: {e}")
-            continue # Если порт вызвал ошибку (например, занят чем-то другим), просто идем к следующему
+            continue  # Ошибка на порте (например, занят) — просто идем к следующему
 
     logging.info("[Utils] Все проверенные порты закрыты. Прокси выключен.")
     return None
@@ -60,14 +59,14 @@ def get_now() -> datetime:
         now = datetime.now(config.TZ)
     else:
         now = datetime.now()
-    # Явно убираем tzinfo, чтобы всегда сравнивать naive datetime
+    # Явно убираем tzinfo: везде сравниваются naive datetime
     return now.replace(second=0, microsecond=0, tzinfo=None)
 
 def get_note_due(note: Dict[str, Any]) -> datetime:
     """
     Извлекает дату дедлайна из заметки по принципу приоритета:
     1. Основной дедлайн заметки (YAML).
-    2. Дедлайн первой найденной задачи (чекбокса/списка).
+    2. Дедлайн первой невыполненной задачи (чекбокса/списка).
     3. datetime.max — если дат нет вообще, заметка улетает в самый конец списка.
     """
     if note.get('due'):
@@ -78,7 +77,6 @@ def get_note_due(note: Dict[str, Any]) -> datetime:
             return t['due']
     return datetime.max
 
-# Извлечение приоритета заметки
 def get_priority(note: Dict[str, Any]) -> int:
     """Извлекает приоритет заметки на основе config.PRIORITY_SOURCES и config.PRIORITY_MAP.
     Возвращает 99, если приоритет не найден (ниже самого низкого)."""
@@ -115,25 +113,27 @@ def sort_notes(
 ) -> List[Dict[str, Any]]:
     """
     Универсальная функция сортировки и группировки заметок.
-    Гарантирует, что группы не будут разрываться при пагинации.
-    Всегда сортирует по ВОЗРАСТАНИЮ (ближайшие вверху).
+    Гарантирует, что группы не будут разрываться при пагинации: возвращает
+    плоский, но строго сгруппированный список, готовый к нарезке на страницы.
 
     Args:
         notes: Список заметок (словарей).
         group_by_source: Группировать ли заметки по источнику (для Дедлайнов).
-        dynamic_sort: Сортировать ли группы по срочности (для Дедлайнов).
+        dynamic_sort: Сортировать ли группы по срочности (по дедлайну первой заметки группы).
         source_order_map: Словарь {имя_источника: порядок} для статической группировки.
-        virtual_group_config: Конфиг для виртуальных групп (используется в Kanban: сначала борды, потом заметки).
+        virtual_group_config: Конфиг виртуальных групп (Kanban): "group_names_order" и "key_func".
+        reverse_base_sort: Направление базовой сортировки по дате (False — по возрастанию).
 
     Returns:
-        Плоский, но строго отсортированный список заметок, готовый к нарезке (пагинации).
+        Плоский отсортированный список заметок, готовый к пагинации.
     """
-    # 1. Сортируем все заметки по дате. Направление задается параметром reverse_base_sort.
-    # Заметки без дат (datetime.max) всегда отправляем в конец списка, независимо от направления сортировки.
+    # 1. Базовая сортировка по дате (направление — reverse_base_sort);
+    # заметки без дат (datetime.max) всегда отправляются в конец списка
+    # независимо от направления
     notes_with_dates = [n for n in notes if get_note_due(n) != datetime.max]
     notes_without_dates = [n for n in notes if get_note_due(n) == datetime.max]
 
-    # Если включена сортировка по приоритету, используем кортеж (дата, приоритет)
+    # Сортировка по приоритету — кортежем (дата, приоритет), вторичный ключ
     if config.ENABLE_PRIORITY_SORT:
         notes_with_dates.sort(key=lambda n: (get_note_due(n), get_priority(n)), reverse=reverse_base_sort)
     else:
@@ -153,10 +153,10 @@ def sort_notes(
             g_name = virtual_group_config["key_func"](n)
             grouped.setdefault(g_name, []).append(n)
 
-        # НОВОЕ: Учитываем dynamic_sort для виртуальных групп
+        # Учитываем dynamic_sort для виртуальных групп
         group_names = list(grouped.keys())
         if dynamic_sort:
-            # Динамическая сортировка: самые срочные группы (по первой задаче) вверх
+            # Динамическая сортировка: самые срочные группы (по дедлайну первой заметки) вверх
             group_names.sort(key=lambda g: get_note_due(grouped[g][0]), reverse=reverse_base_sort)
         else:
             # Статическая сортировка: по порядку из конфига (борды/заметки)
@@ -178,7 +178,7 @@ def sort_notes(
             # Статическая сортировка: по порядку из config.py
             group_names.sort(key=lambda g: source_order_map.get(g, 99) if source_order_map else 99)
 
-    # 3. Сборка в список
+    # 3. Сборка в плоский список
     flat = []
     for g in group_names:
         flat.extend(grouped[g])

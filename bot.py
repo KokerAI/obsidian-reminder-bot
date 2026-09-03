@@ -26,27 +26,28 @@ from typing import Any, Callable, Dict, Awaitable, Optional
 from logging.handlers import RotatingFileHandler
 
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
-# CHANGED: Чтение уровня логирования из конфига (INFO по умолчанию, DEBUG для дебага)
+# Уровень логирования берется из config.py ("INFO" / "DEBUG" / "WARNING"), по умолчанию — INFO
 LOG_LEVEL = getattr(logging, getattr(config, 'LOG_LEVEL', 'INFO').upper(), logging.INFO)
 logger = logging.getLogger()
 logger.setLevel(LOG_LEVEL)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-# Защита от дублирования хендлеров при повторных импортах (циклический импорт)
+# Обработчики логов добавляются один раз: root-логгер может быть уже настроен
+# при повторном импорте модуля (bot.py <-> handlers.py)
 if not logger.handlers:
-    # Запись в файл (макс 5 МБ, храним 3 последних файла)
+    # Запись в файл с ротацией: до 5 МБ на файл, 3 последних бэкапа
     file_handler = RotatingFileHandler('bot.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # Вывод в консоль
+    # Дублируем вывод в консоль
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
 # --- WATCHDOG (ОПЦИОНАЛЬНО) ---
 # Библиотека для мгновенного обновления кэша при изменении файлов Obsidian.
-# Если не установлена (pip install watchdog), бот просто использует таймер на 30 сек.
+# Если не установлена (pip install watchdog), бот использует таймер на 30 сек.
 try:
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
@@ -56,6 +57,7 @@ except ImportError:
 
 if WATCHDOG_AVAILABLE:
     class VaultEventHandler(FileSystemEventHandler):
+        """Сбрасывает кэш парсера при создании/изменении/удалении .md-файлов хранилища."""
         def on_modified(self, event):
             if not event.is_directory and event.src_path.endswith('.md'):
                 logging.info(f"[WATCHDOG] Файл изменен: {event.src_path}. Сброс кэша.")
@@ -70,17 +72,15 @@ if WATCHDOG_AVAILABLE:
                 vault.clear_cache()
 
 # --- ИНИЦИАЛИЗАЦИЯ БОТА ---
-# Создаем сессию с прокси и таймаутом из конфига
-# Умная проверка прокси
+# Сессия с таймаутом из конфига; прокси определяется автоматически (см. utils.get_active_proxy)
 active_proxy = utils.get_active_proxy()
 session = AiohttpSession(proxy=active_proxy, timeout=config.REQUEST_TIMEOUT)
-# session = AiohttpSession(proxy=config.PROXY_URL, timeout=config.REQUEST_TIMEOUT)
-# NEW: Глобально отключаем превью ссылок во ВСЕХ сообщениях (send_message и edit_text),
-# включая пуши, сводку и редактирование при пагинации. Тумблер — DISABLE_LINK_PREVIEW в config.py.
+# Превью ссылок глобально отключается во всех сообщениях (send_message и edit_text):
+# пушах, сводке и редактировании при пагинации. Тумблер — DISABLE_LINK_PREVIEW в config.py.
 bot = Bot(token=config.BOT_TOKEN, session=session, default=DefaultBotProperties(link_preview_is_disabled=config.DISABLE_LINK_PREVIEW))
 dp = Dispatcher()
 
-# Абсолютный путь к файлу настроек (защита от потери при запуске из другой директории)
+# Абсолютный путь к settings.json — не зависит от директории запуска бота
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
 STATUS_BUTTONS = config.STATUS_BUTTONS
@@ -88,15 +88,17 @@ SOURCE_BUTTONS = config.SOURCE_BUTTONS
 SOURCE_ICON = config.SOURCE_ICON
 CARD_ICON = config.CARD_ICON
 
-# Обратные словари для быстрого получения эмодзи по статусу/источнику
-# Поддержка новых STATUS_BUTTONS (словарь словарей)
+# Обратные словари: быстрое получение эмодзи по статусу/источнику.
+# STATUS_BUTTONS — словарь словарей (статусы по проектам), поэтому разворачиваем его в плоский вид.
 ALL_STATUSES = {}
 for src_key, statuses in STATUS_BUTTONS.items():
     for btn, status in statuses.items():
         ALL_STATUSES[status] = btn.replace(status, "", 1).strip()
 
-STATUS_EMOJI = ALL_STATUSES # Используем общий словарь
+STATUS_EMOJI = ALL_STATUSES  # Алиас: единообразие с SOURCE_EMOJI
+# Эмодзи источника — первый токен текста кнопки из SOURCE_BUTTONS
 SOURCE_EMOJI = {src: btn.split(" ", 1)[0] if " " in btn else "" for btn, src in SOURCE_BUTTONS.items()}
+# Иконка по отображаемому имени источника: SOURCES["icon"] -> кнопка -> дефолт
 SOURCE_ICON_BY_NAME = {cfg.get("name"): cfg.get("icon") or SOURCE_EMOJI.get(key) or SOURCE_ICON for key, cfg in config.SOURCES.items()}
 
 def _status_icon(status: str) -> str:
@@ -110,7 +112,7 @@ def _source_icon_for(source_key: str) -> str:
 
 def default_settings() -> Dict[str, Any]:
     """Возвращает словарь с настройками по умолчанию для нового пользователя."""
-    # По умолчанию везде "Сначала новые" (new) и "Снизу вверх" (btt). Группировка по умолчанию везде ВЫКЛЮЧЕНА
+    # Дефолты отображения: "Сначала новые" (new), "Снизу вверх" (btt); группировка везде выключена
     return {
         "intervals": [60], "at_start": True, "notified_tasks": set(), "is_active": True,
         "sort_order": "new", "sort_dir": "btt",
@@ -124,7 +126,8 @@ def default_settings() -> Dict[str, Any]:
 
 # --- РАБОТА С JSON (Сохранение настроек) ---
 def load_user_settings() -> Dict[int, Dict[str, Any]]:
-    """Загружает настройки из файла settings.json. Чистит пробелы в ключах, гарантирует типы данных."""
+    """Загружает настройки из settings.json: чистит ключи, восстанавливает типы,
+    мигрирует устаревшие значения и заполняет пропуски дефолтами."""
     try:
         with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -144,7 +147,7 @@ def load_user_settings() -> Dict[int, Dict[str, Any]]:
         notified = settings.get("notified_tasks", [])
         settings["notified_tasks"] = set(notified) if isinstance(notified, list) else set()
 
-        # ИСПРАВЛЕНО: Автоматическая миграция старых настроек asc/desc/far на новые new/old
+        # Автомиграция устаревших значений сортировки: asc -> new, desc/far -> old
         if settings.get("sort_order") in ["asc", "new"]: settings["sort_order"] = "new"
         elif settings.get("sort_order") in ["desc", "far", "old"]: settings["sort_order"] = "old"
 
@@ -157,11 +160,12 @@ def load_user_settings() -> Dict[int, Dict[str, Any]]:
         if settings.get("projects_sort_order") in ["asc", "new"]: settings["projects_sort_order"] = "new"
         elif settings.get("projects_sort_order") in ["desc", "far", "old"]: settings["projects_sort_order"] = "old"
 
-        # Заполняем дефолтами, чтобы избежать KeyError
+        # Заполняем недостающие ключи дефолтами (старые settings.json не ломаются на новых настройках)
         defaults = default_settings()
         for d_key, d_val in defaults.items():
             settings.setdefault(d_key, d_val)
 
+        # Гарантируем список int для интервалов
         try: settings["intervals"] = [int(x) for x in settings["intervals"]]
         except Exception: settings["intervals"] = [60]
         user_settings[uid] = settings
@@ -175,15 +179,18 @@ def save_user_settings():
     for uid, settings in user_settings.items():
         temp = settings.copy()
         if isinstance(temp.get("notified_tasks"), set):
-            # Сортируем по убыванию (от свежих к старым), чтобы срез оставлял последние 500 ключей.
-            # set - неупорядоченное множество, без сортировки срез[-500:] удалял бы случайные свежие ключи (вызвал бы спам).
+            # Ключи начинаются с даты (YYYYMMDDHHMM), поэтому лексикографическая сортировка
+            # по убыванию упорядочивает их от свежих к старым: срез [:500] оставляет последние 500.
+            # Без сортировки (set не хранит порядок) удалялись бы случайные ключи — в том числе
+            # свежие, что приводило бы к повторным уведомлениям.
             notified_list = sorted(list(temp["notified_tasks"]), reverse=True)
             if len(notified_list) > 500:
                 notified_list = notified_list[:500]
             temp["notified_tasks"] = notified_list
         data_to_save[str(uid)] = temp
 
-    # АТОМАРНАЯ ЗАПИСЬ. Пишем во временный файл, затем безопасно заменяем основной.
+    # Атомарная запись: сначала во временный файл, затем os.replace поверх основного
+    # (settings.json не повредится даже при сбое в момент записи)
     dir_name = os.path.dirname(SETTINGS_FILE)
     try:
         fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
@@ -199,7 +206,7 @@ user_settings = load_user_settings()
 
 # --- MIDDLEWARE ---
 class AccessMiddleware(BaseMiddleware):
-    """Middleware для ограничения доступа к боту по CHAT_ID."""
+    """Middleware для ограничения доступа к боту по ALLOWED_ID (CHAT_ID из .env)."""
     async def __call__(self, handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]], event: TelegramObject, data: Dict[str, Any]) -> Any:
         user = data.get("event_from_user")
         if not user or user.id != config.ALLOWED_ID:
@@ -208,16 +215,16 @@ class AccessMiddleware(BaseMiddleware):
             return None
         return await handler(event, data)
 
-# Привязываем middleware к глобальному Dispatcher (dp), чтобы она работала для всех роутеров.
+# Привязываем middleware к глобальному Dispatcher: оно сработает для всех роутеров
 dp.message.outer_middleware(AccessMiddleware())
 dp.callback_query.outer_middleware(AccessMiddleware())
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ UI ---
 async def safe_edit(callback: CallbackQuery, text: Optional[str] = None, reply_markup=None, parse_mode="HTML"):
-    """Централизованная и безопасная функция редактирования сообщений (DRY).
-    Предотвращает падение бота при ошибке 'message is not modified'."""
+    """Централизованное безопасное редактирование сообщений (DRY).
+    Ошибка 'message is not modified' игнорируется, остальные — логируются и пробрасываются."""
     try:
-        # Проверка на None, чтобы пустая строка не считывалась как отсутствие текста
+        # None означает редактирование только клавиатуры; пустая строка — валидный текст
         if text is not None:
             await callback.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         else:
@@ -230,32 +237,27 @@ async def safe_edit(callback: CallbackQuery, text: Optional[str] = None, reply_m
 # --- КЛАВИАТУРЫ ---
 def main_menu_kb() -> ReplyKeyboardMarkup:
     """Создает главную клавиатуру (Reply), скрывая кнопки отключенных источников."""
-    # Тексты берутся из config.py
     kb = [[KeyboardButton(text=config.BTN_DEADLINES)]]
-    # ---
-    # Группировка кнопок источников в один ряд
-    # row = [KeyboardButton(text=btn_text) for btn_text, src_key in SOURCE_BUTTONS.items() if config.SOURCES.get(src_key, {}).get("enabled")]
-    # if row: kb.append(row)
-
-    # Собираем все включенные кнопки источников
+    # Кнопки только включенных источников
     src_buttons = [KeyboardButton(text=btn_text) for btn_text, src_key in SOURCE_BUTTONS.items() if config.SOURCES.get(src_key, {}).get("enabled")]
 
-    # Разбиваем кнопки по 3 в ряд, чтобы 4-я кнопка переносилась на новую строку
+    # Разбивка по 3 кнопки в ряд (4-я переносится на новую строку)
     for i in range(0, len(src_buttons), 3):
         kb.append(src_buttons[i:i+3])
-    # ---
+
     kb.append([KeyboardButton(text=config.BTN_SETTINGS)])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def settings_menu_kb() -> ReplyKeyboardMarkup:
     """Создает клавиатуру меню настроек (Reply)."""
-    # CHANGED: Тексты берутся из config.py, а кнопки источников генерируются автоматически
+    # Тексты кнопок — из config.py, кнопки источников генерируются автоматически
     kb = [
         [KeyboardButton(text=config.BTN_NOTIFY), KeyboardButton(text=config.BTN_DEADLINES)],
         [KeyboardButton(text=btn_text) for btn_text, src_key in SOURCE_BUTTONS.items() if config.SOURCES.get(src_key, {}).get("enabled")],
         [KeyboardButton(text=config.BTN_EXTRA_SETTINGS)],
         [KeyboardButton(text=config.BTN_MAIN_MENU)]
     ]
+    # Отбрасываем пустые ряды (если все источники выключены)
     kb = [row for row in kb if row]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -275,23 +277,24 @@ def upcoming_kb(period, page, total_count, limit=config.PAGINATION_LIMIT) -> Inl
 
 # Меню выбора проекта (если их несколько)
 def projects_menu_kb(projects_list) -> InlineKeyboardMarkup:
-    """Создает inline-клавиатуру для выбора подпапки проекта."""
+    """Создает inline-клавиатуру для выбора проекта (подпапки в Projects)."""
     rows = []
     for proj in projects_list:
         rows.append([InlineKeyboardButton(text=f"📁 {proj}", callback_data=f"prjset|{proj}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ИЗМЕНЕНО: Добавлен параметр project_name и логика уникальных статусов
 def tasks_nav_kb(source, status, page, total_count, project_name=None, limit=config.PAGINATION_LIMIT) -> InlineKeyboardMarkup:
-    """Создает inline-клавиатуру для списка задач. Для Projects добавляет кнопки статусов сверху."""
+    """Создает inline-клавиатуру списка задач: пагинация, а для Projects — кнопки
+    уникальных статусов проекта (с фолбэком на "_default") и возврат к выбору проекта."""
     rows = []
 
-    # Обработка проектов и их уникальных статусов
+    # Статусы конкретного проекта или дефолтные
     statuses = {}
     if source == 'projects':
         statuses = STATUS_BUTTONS.get(project_name, STATUS_BUTTONS.get("_default", {}))
         rows.append([InlineKeyboardButton(text="🔙 К выбору проекта", callback_data="back_to_prj_menu")])
 
+    # Плейсхолдер "_" для источников без проекта
     cb_proj = project_name if project_name else "_"
 
     if statuses:
@@ -334,7 +337,8 @@ def extra_settings_kb(user_id) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3])
 
 def display_settings_kb(user_id) -> InlineKeyboardMarkup:
-    """Создает inline-клавиатуру настроек отображения дедлайнов (4 независимые кнопки)."""
+    """Создает inline-клавиатуру настроек отображения дедлайнов: порядок и направление
+    сортировки, группировка по источникам, динамическая сортировка групп."""
     s = user_settings.get(user_id, default_settings())
     row1 = [
         InlineKeyboardButton(text=f"🆕 Сначала новые{' ✅' if s.get('sort_order') == 'new' else ''}", callback_data="set_sort_new"),
@@ -344,19 +348,21 @@ def display_settings_kb(user_id) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=f"⬇️ Сверху вниз{' ✅' if s.get('sort_dir') == 'ttb' else ''}", callback_data="set_dir_ttb"),
         InlineKeyboardButton(text=f"⬆️ Снизу вверх{' ✅' if s.get('sort_dir') == 'btt' else ''}", callback_data="set_dir_btt")
     ]
-    # Единое название и эмодзи для Группировки
+    # Кнопка группировки (единый текст с меню Kanban)
     row3 = [InlineKeyboardButton(text=f"🔀 Группировка {'✅' if s.get('group_by_source') else '❌'}", callback_data="tog_group")]
+    # Динамическая сортировка групп по срочности
     row4 = [InlineKeyboardButton(text=f"⚡️ Группы в порядке срочности {'✅' if s.get('dynamic_sort') else '❌'}", callback_data="tog_dyn_sort")]
     row5 = [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_notify_settings")]
     return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3, row4, row5])
 
 def kanban_settings_kb(user_id) -> InlineKeyboardMarkup:
-    """Создает inline-клавиатуру настроек Kanban (4 независимые кнопки + группировка)."""
+    """Создает inline-клавиатуру настроек Kanban: порядок и направление сортировки,
+    тип группировки (борды/заметки) и динамическая сортировка групп."""
     s = user_settings.get(user_id, default_settings())
     kanban_group = s.get("kanban_primary_group", "none")
     is_grouped = (kanban_group != "none")
 
-    # 4 независимые кнопки для Kanban
+    # Порядок и направление сортировки
     row1 = [
         InlineKeyboardButton(text=f"🆕 Сначала новые{' ✅' if s.get('kanban_sort_order') == 'new' else ''}", callback_data="set_kanban_sort_new"),
         InlineKeyboardButton(text=f"📅 Сначала старые{' ✅' if s.get('kanban_sort_order') == 'old' else ''}", callback_data="set_kanban_sort_old")
@@ -365,14 +371,15 @@ def kanban_settings_kb(user_id) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=f"⬇️ Сверху вниз{' ✅' if s.get('kanban_sort_dir') == 'ttb' else ''}", callback_data="set_kanban_dir_ttb"),
         InlineKeyboardButton(text=f"⬆️ Снизу вверх{' ✅' if s.get('kanban_sort_dir') == 'btt' else ''}", callback_data="set_kanban_dir_btt")
     ]
+    # Тип группировки
     row3 = [
         InlineKeyboardButton(text=f"📋 Сначала борды{' ✅' if is_grouped and kanban_group == 'boards_first' else ''}", callback_data="set_kanban_group_boards"),
         InlineKeyboardButton(text=f"📝 Сначала заметки{' ✅' if is_grouped and kanban_group == 'notes_first' else ''}", callback_data="set_kanban_group_notes")
     ]
-    # Единое название и эмодзи для Группировки
+    # Кнопка группировки (единый текст с меню Дедлайнов)
     row4 = [InlineKeyboardButton(text=f"🔀 Группировка {'✅' if is_grouped else '❌'}", callback_data="tog_kanban_group")]
 
-    # Динамическая сортировка групп в Канбан
+    # Динамическая сортировка групп
     row5 = [InlineKeyboardButton(text=f"⚡️ Группы в порядке срочности {'✅' if s.get('kanban_dynamic_sort', True) else '❌'}", callback_data="tog_kanban_dyn_sort")]
 
     row6 = [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_settings_menu")]
@@ -380,7 +387,7 @@ def kanban_settings_kb(user_id) -> InlineKeyboardMarkup:
 
 
 def tasks_settings_kb(user_id) -> InlineKeyboardMarkup:
-    """Создает inline-клавиатуру настроек Tasks (4 независимые кнопки)."""
+    """Создает inline-клавиатуру настроек Tasks: порядок и направление сортировки."""
     s = user_settings.get(user_id, default_settings())
     row1 = [
         InlineKeyboardButton(text=f"🆕 Сначала новые{' ✅' if s.get('tasks_sort_order') == 'new' else ''}", callback_data="set_tasks_sort_new"),
@@ -394,7 +401,8 @@ def tasks_settings_kb(user_id) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3])
 
 def projects_settings_kb(user_id) -> InlineKeyboardMarkup:
-    """Создает inline-клавиатуру настроек Projects (4 независимые кнопки без настроек групп)."""
+    """Создает inline-клавиатуру настроек Projects: порядок и направление сортировки
+    (настроек групп, как у Kanban, нет)."""
     s = user_settings.get(user_id, default_settings())
     row1 = [
         InlineKeyboardButton(text=f"🆕 Сначала новые{' ✅' if s.get('projects_sort_order') == 'new' else ''}", callback_data="set_projects_sort_new"),
@@ -419,26 +427,26 @@ def format_note_card(note: Dict[str, Any], show_source: bool = False) -> str:
     if config.SHOW_PROPERTIES:
         hidden_fields = set(config.HIDDEN_FIELDS)
         def format_val(val):
-            """Вспомогательная функция для форматирования значений свойств."""
+            """Форматирует значение YAML-свойства в строку для вывода в карточке."""
             if val is None: return ""
             if isinstance(val, bool): return "true" if val else "false"
             if isinstance(val, list): return ", ".join(str(v) for v in val)
             if isinstance(val, datetime): return val.strftime("%d.%m.%Y %H:%M")
-            if isinstance(val, date): return val.strftime("%d.%m.%Y")  # Проверка datetime идет ПЕРВОЙ, т.к. он наследник date
+            if isinstance(val, date): return val.strftime("%d.%m.%Y")  # datetime проверяется ПЕРВОЙ: он наследник date
             return str(val)
 
         for key, val in note.get("raw_metadata", {}).items():
             if key in hidden_fields: continue
             val_str = ""
 
-            # --- АВТОМАТИЧЕСКАЯ ПОДСТАНОВКА ЭМОДЗИ ДЛЯ ВИЗУАЛЬНОГО ЕДИНООБРАЗИЯ ---
+            # Подстановка эмодзи к известным полям — единообразие с плагинами Obsidian
             if key == "status":
-                # _status_icon уже возвращает "Эмодзи " (с пробелом)
+                # _status_icon возвращает "эмодзи " (с пробелом)
                 val_str = _status_icon(note['status']) + note['status']
             elif key in config.DUE_FIELDS:
                 val_str = "📅 " + note['due_str']
             elif key in config.CREATED_FIELDS:
-                val_str = "➕ " + note['created_str'] # ➕ - стандарт Obsidian Tasks для created
+                val_str = "➕ " + note['created_str']  # ➕ — маркер created в Obsidian Tasks
             elif key == "tags":
                 val_str = ' '.join(f"#{t}" for t in note['tags']) if note['tags'] else ""
             else:
@@ -453,30 +461,35 @@ def format_note_card(note: Dict[str, Any], show_source: bool = False) -> str:
         body_text = html.escape(body_text)
         body_text = re.sub(r'^##\s+(.*)$', r'<b>📌 \1</b>', body_text, flags=re.MULTILINE)
         def indent_to_nbsp(match):
-            """Заменяет пробелы/табы в начале строки на невидимый символ Брайля для сохранения отступов."""
+            """Заменяет пробелы/табы в начале строки на невидимые символы Брайля — сохраняет отступы."""
             indent = match.group(1).expandtabs(4)
             return "⠀" * len(indent)
 
-        # ИСПРАВЛЕНО: Используем [ \t] вместо \s, чтобы не съедать переносы строк (\n)
+        # Чекбоксы, списки и отступы — в Telegram-представление.
+        # [ \t] вместо \s, чтобы не съедать переносы строк
         body_text = re.sub(r'^([ \t]*)-[ \t]*\[[ \t]*\][ \t]*', lambda m: indent_to_nbsp(m) + config.CHECKBOX_UNCHECKED + ' ', body_text, flags=re.MULTILINE)
         body_text = re.sub(r'^([ \t]*)-[ \t]*\[[xXvV]\][ \t]*', lambda m: indent_to_nbsp(m) + config.CHECKBOX_CHECKED + ' ', body_text, flags=re.MULTILINE)
         body_text = re.sub(r'^([ \t]*)[-*][ \t]+', lambda m: indent_to_nbsp(m) + '• ', body_text, flags=re.MULTILINE)
         body_text = re.sub(r'^([ \t]*)(\d+)\.[ \t]+', lambda m: indent_to_nbsp(m) + f'<b>{m.group(2)}.</b> ', body_text, flags=re.MULTILINE)
         body_text = re.sub(r'^([ \t]+)(?=\S)', indent_to_nbsp, body_text, flags=re.MULTILINE)
+        # Ограничение длины тела карточки
         if len(body_text) > 800: body_text = body_text[:800] + "..."
         text += f"{body_text}\n"
 
-    # Трюк для растягения blockquote на всю ширину (60 невидимых символов)
+    # Хвост из 60 невидимых символов растягивает blockquote на всю ширину
     text = text.rstrip(' \n') + "\n" + "⠀" * 60
     return f"<blockquote>{text}</blockquote>\n"
 
 
-# Карточка для пуша по подзадаче (карточке Kanban / чекбоксу). В компактном
-# режиме (NOTIFY_CARD_ONLY в конфиге) — только файл и дата, без тела всей заметки/борды.
 def _task_notify_card(note: Dict[str, Any], task_text: Optional[str], due_dt: datetime) -> str:
+    """Карточка пуша по подзадаче (карточке Kanban / чекбоксу).
+
+    В компактном режиме (NOTIFY_CARD_ONLY) — только файл и дата, без тела
+    заметки/борды; иначе полная карточка через format_note_card.
+    """
     if task_text and config.NOTIFY_CARD_ONLY:
         text = f"{CARD_ICON} <b>{html.escape(str(note['filename']))}</b>\n📅 {due_dt.strftime('%d.%m.%Y %H:%M')}\n"
-        # Трюк для растягения blockquote на всю ширину (60 невидимых символов)
+        # Хвост из 60 невидимых символов растягивает blockquote на всю ширину
         text = text.rstrip(' \n') + "\n" + "⠀" * 60
         return f"<blockquote>{text}</blockquote>\n"
     return format_note_card(note)
@@ -501,22 +514,22 @@ async def check_and_notify():
             notes = vault.get_active_notes_for_notify()
             logging.info(f"[ПЛАНИРОВЩИК] Найдено активных заметок с дедлайнами: {len(notes)}")
             for note in notes:
-                # Проверяем основной дедлайн заметки (если он не взят из текста - fallback)
+                # Основной YAML-дедлайн заметки (fallback из подзадач не дублируем — они проверяются ниже)
                 if note['due'] and not note.get('due_is_fallback'):
                     logging.debug(f"[ПЛАНИРОВЩИК] Проверка заметки '{note['filename']}'. Дедлайн: {note['due']}")
                     await process_due(user_id, settings, note['due'], note)
-                # Проверяем дедлайны подзадач
+                # Дедлайны подзадач (карточек Kanban / чекбоксов)
                 for t in note['tasks']:
                     if t['due'] and not t['done']:
                         logging.debug(f"[ПЛАНИРОВЩИК] Проверка подзадачи '{t['text']}'. Дедлайн: {t['due']}")
-                        # Передаем колонку канбан-карточки отдельным параметром
+                        # Колонка канбан-карточки передается отдельным параметром
                         await process_due(user_id, settings, t['due'], note, t['text'], t.get('column'))
         except Exception as e:
             logging.error(f"[КРИТИЧЕСКАЯ ОШИБКА] Ошибка нотификации: {e}", exc_info=True)
 
 # Утренняя сводка
 async def send_daily_digest():
-    """Фоновая задача для утренней сводки (APScheduler). Запускается по расписанию."""
+    """Фоновая задача утренней сводки (APScheduler). Запускается по расписанию DIGEST_TIME."""
     logging.info("[ПЛАНИРОВЩИК] Проверка утренней сводки...")
     if config.ALLOWED_ID not in user_settings: return
     settings = user_settings[config.ALLOWED_ID]
@@ -526,7 +539,7 @@ async def send_daily_digest():
     now = utils.get_now()
     start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Выбор горизонта для сводки (24 часа или до конца дня)
+    # Горизонт сводки: 24 часа или до конца дня (DIGEST_DAY_VIEW)
     if getattr(config, 'DIGEST_DAY_VIEW', 'today') == "today":
         end_of_today = now.replace(hour=23, minute=59, second=0, microsecond=0)
     else:
@@ -536,7 +549,7 @@ async def send_daily_digest():
     upcoming = vault.get_upcoming_notes(max_date=end_of_today)
     overdue = vault.get_overdue_notes()
 
-    # ИСПРАВЛЕНО: Оставляем только те задачи, дедлайн которых строго сегодня (отсекаем старые просрочки и будущие)
+    # Оставляем только дедлайны на сегодня (старые просрочки и будущие отсекаются)
     notes_set = set()
     all_notes = []
     for n in upcoming + overdue:
@@ -544,8 +557,8 @@ async def send_daily_digest():
         if getattr(config, 'HIDE_COMPLETED_IN_DEADLINES', False) and n['status'] in config.INACTIVE_STATUSES: continue
 
         due = utils.get_note_due(n)
-        # CHANGED: Проверяем не только дедлайн заметки, но и подзадачи (карточки Kanban / чекбоксы):
-        # иначе задача на сегодня не попадет в сводку, если у заметки/борды есть более ранняя дата.
+        # Дедлайн сегодня — у заметки ИЛИ у подзадачи (карточки Kanban / чекбокса):
+        # иначе задача на сегодня не попала бы в сводку при более ранней дате заметки/борды
         in_window = due != datetime.max and start_of_today <= due <= end_of_today
         if not in_window:
             in_window = any(
@@ -578,11 +591,12 @@ async def send_daily_digest():
         logging.error(f"[ОШИБКА ОТПРАВКИ] Не удалось отправить сводку: {e}")
 
 async def process_due(user_id, settings, due_dt, note, task_text=None, task_column=None):
-    """Сравнивает время дедлайна с текущим временем и отправляет уведомления с учетом Grace Window (2 мин)."""
+    """Сравнивает дедлайн с текущим временем и отправляет уведомления
+    с учетом Grace Window (окно 2 минуты против пропусков при задержке cron)."""
     if not isinstance(settings.get("notified_tasks"), set):
         settings["notified_tasks"] = set(settings.get("notified_tasks") or [])
 
-    # Проверка тихих часов из пользовательских настроек
+    # Тихие часы (пользовательская настройка): в них уведомления не отправляются
     if settings.get("quiet_hours", False):
         current_hour = utils.get_now().hour
         start_q, end_q = config.QUIET_HOURS
@@ -594,29 +608,29 @@ async def process_due(user_id, settings, due_dt, note, task_text=None, task_colu
     now = utils.get_now()
     settings_changed = False
     due_key_str = due_dt.strftime("%Y%m%d%H%M")
-    safe_task_text = (task_text or "")[:50]
+    safe_task_text = (task_text or "")[:50]  # Текст задачи в ключе нотификации — усеченный
     grace = timedelta(minutes=2)
 
-    # Читаем настройку беззвучных пушей
+    # Беззвучные пуши (пользовательская настройка)
     disable_notif = settings.get("silent_notifications", False)
 
-    # 1. Проверка интервалов (за X минут до дедлайна)
+    # 1. Интервалы: за X минут до дедлайна
     for interval in settings.get("intervals", []):
         trigger_time = due_dt - timedelta(minutes=interval)
         # Дебаг-лог для проверки интервалов
         logging.debug(f"[DEBUG] Интервал {interval} мин. Now: {now}, Trigger: {trigger_time}, Grace end: {trigger_time + grace}")
         if trigger_time <= now <= trigger_time + grace:
-            # Дата (due_key_str) перенесена в начало ключа, чтобы sorted() работал хронологически.
+            # Дата (due_key_str) стоит в начале ключа: лексикографическая сортировка
+            # в save_user_settings совпадает с хронологической
             notify_key = f"{due_key_str}_{note['filename']}_{safe_task_text}_{interval}"
             if notify_key not in settings["notified_tasks"]:
                 logging.info(f"[УВЕДОМЛЕНИЕ] Срабатывание интервала -{interval} мин. Ключ: {notify_key}")
                 msg = f"⏰ <b>Напоминание (-{interval} мин)!</b>\n"
-                # Экранируем текст задачи (HTML) — карточки с <, >, & раньше ломали отправку пуша.
-                # Колонка канбана рендерится в заголовке из технического поля задачи (текст чист от рождения)
+                # Текст задачи и колонка экранируются (HTML): карточки с <, >, & ломали отправку пуша
                 if task_text:
                     col_prefix = f"[{html.escape(task_column)}] " if task_column else ""
                     msg += f"Задача: {col_prefix}{html.escape(task_text)}\n"
-                # Компактный режим пуша по задаче (NOTIFY_CARD_ONLY) или полная карточка заметки
+                # Компактный режим пуша (NOTIFY_CARD_ONLY) или полная карточка заметки
                 msg += _task_notify_card(note, task_text, due_dt)
                 try:
                     await bot.send_message(user_id, msg, parse_mode="HTML", disable_notification=disable_notif)
@@ -626,11 +640,10 @@ async def process_due(user_id, settings, due_dt, note, task_text=None, task_colu
                 except Exception as e:
                     logging.error(f"[ОШИБКА ОТПРАВКИ] Не удалось отправить сообщение: {e}")
 
-    # 2. Проверка "В момент начала"
+    # 2. Уведомление "В момент начала"
     if settings.get("at_start") and due_dt <= now <= due_dt + grace:
         # Дебаг-лог для проверки "В момент начала"
         logging.debug(f"[DEBUG] 'В момент начала'. Now: {now}, Due: {due_dt}, Grace end: {due_dt + grace}")
-        # Дата (due_key_str) перенесена в начало ключа.
         notify_key = f"{due_key_str}_{note['filename']}_{safe_task_text}_start"
         if notify_key not in settings["notified_tasks"]:
             logging.info(f"[УВЕДОМЛЕНИЕ] Срабатывание 'В момент начала'. Ключ: {notify_key}")
@@ -655,7 +668,7 @@ async def process_due(user_id, settings, due_dt, note, task_text=None, task_colu
 # --- ЗАПУСК БОТА ---
 async def main():
     """Главная асинхронная функция. Регистрирует команды, настраивает планировщик, запускает поллинг."""
-    # Импортируем роутер из handlers.py здесь, чтобы избежать циклических импортов
+    # Роутер импортируется здесь, а не на уровне модуля, — чтобы избежать циклического импорта
     import handlers
     dp.include_router(handlers.router)
 
@@ -666,9 +679,10 @@ async def main():
         BotCommand(command="help", description="Справка по боту")
     ])
     scheduler = AsyncIOScheduler(timezone=config.TZ)
+    # Проверка дедлайнов — каждую минуту
     scheduler.add_job(check_and_notify, 'cron', minute='*')
 
-    # Добавляем задачу для утренней сводки
+    # Утренняя сводка — по расписанию DIGEST_TIME
     try:
         d_hour, d_minute = map(int, config.DIGEST_TIME.split(':'))
         scheduler.add_job(send_daily_digest, 'cron', hour=d_hour, minute=d_minute)
@@ -678,7 +692,7 @@ async def main():
     scheduler.start()
     logging.info(f"Планировщик запущен. Бот работает для CHAT_ID: {config.ALLOWED_ID}")
 
-    # ИНИЦИАЛИЗАЦИЯ WATCHDOG
+    # Инициализация Watchdog (мгновенный сброс кэша при изменении файлов)
     observer = None
     if WATCHDOG_AVAILABLE:
         observer = Observer()
@@ -692,6 +706,7 @@ async def main():
     else:
         logging.info("Библиотека watchdog не установлена. Кэш обновляется по таймеру (30 сек).")
 
+    # Поллинг с автоматическим переподключением при сетевых сбоях
     try:
         while True:
             try:

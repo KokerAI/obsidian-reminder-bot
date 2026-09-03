@@ -1,4 +1,4 @@
-# run.py
+"""Точка входа: запуск бота."""
 import asyncio
 from bot import main
 
