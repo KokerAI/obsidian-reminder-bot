@@ -10,20 +10,33 @@ import json
 import html
 import asyncio
 import logging
+import signal
 import tempfile
 import config
 import utils
 import obsidian_parser as vault
+from contextlib import suppress
 from datetime import datetime, date, timedelta
 from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, TelegramObject, ReplyKeyboardMarkup, KeyboardButton, BotCommand)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramServerError
 from aiohttp import ClientError
 from typing import Any, Callable, Dict, Awaitable, Optional
 from logging.handlers import RotatingFileHandler
+
+# Сетевые ошибки, при которых запуск повторяется, а не роняет бота.
+# aiogram оборачивает сбои aiohttp в TelegramNetworkError, ответы 5xx Telegram —
+# в TelegramServerError; оба не наследуют ClientError, поэтому ловятся явным перечислением.
+# Сбои прокси (aiohttp_socks) никем не оборачиваются и приходят сырыми типами.
+try:
+    from aiohttp_socks import ProxyError, ProxyConnectionError, ProxyTimeoutError
+    _socks_errors = (ProxyError, ProxyConnectionError, ProxyTimeoutError)
+except ImportError:
+    _socks_errors = ()  # прямое соединение без прокси — прокси-ошибок не бывает
+NETWORK_ERRORS = (TelegramNetworkError, TelegramServerError, ClientError, ConnectionError, OSError, *_socks_errors)
 
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
 # Уровень логирования берется из config.py ("INFO" / "DEBUG" / "WARNING"), по умолчанию — INFO
@@ -192,6 +205,7 @@ def save_user_settings():
     # Атомарная запись: сначала во временный файл, затем os.replace поверх основного
     # (settings.json не повредится даже при сбое в момент записи)
     dir_name = os.path.dirname(SETTINGS_FILE)
+    tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -199,7 +213,8 @@ def save_user_settings():
         os.replace(tmp_path, SETTINGS_FILE)
     except Exception as e:
         logging.error(f"Критическая ошибка сохранения settings.json: {e}")
-        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+        # Временный файл удаляется, только если успел создаться и не был переименован
+        if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 user_settings = load_user_settings()
@@ -467,8 +482,8 @@ def format_note_card(note: Dict[str, Any], show_source: bool = False) -> str:
 
         # Чекбоксы, списки и отступы — в Telegram-представление.
         # [ \t] вместо \s, чтобы не съедать переносы строк
-        body_text = re.sub(r'^([ \t]*)-[ \t]*\[[ \t]*\][ \t]*', lambda m: indent_to_nbsp(m) + config.CHECKBOX_UNCHECKED + ' ', body_text, flags=re.MULTILINE)
-        body_text = re.sub(r'^([ \t]*)-[ \t]*\[[xXvV]\][ \t]*', lambda m: indent_to_nbsp(m) + config.CHECKBOX_CHECKED + ' ', body_text, flags=re.MULTILINE)
+        body_text = re.sub(r'^([ \t]*)-[ \t]*\[[ \t]*][ \t]*', lambda m: indent_to_nbsp(m) + config.CHECKBOX_UNCHECKED + ' ', body_text, flags=re.MULTILINE)
+        body_text = re.sub(r'^([ \t]*)-[ \t]*\[[xXvV]][ \t]*', lambda m: indent_to_nbsp(m) + config.CHECKBOX_CHECKED + ' ', body_text, flags=re.MULTILINE)
         body_text = re.sub(r'^([ \t]*)[-*][ \t]+', lambda m: indent_to_nbsp(m) + '• ', body_text, flags=re.MULTILINE)
         body_text = re.sub(r'^([ \t]*)(\d+)\.[ \t]+', lambda m: indent_to_nbsp(m) + f'<b>{m.group(2)}.</b> ', body_text, flags=re.MULTILINE)
         body_text = re.sub(r'^([ \t]+)(?=\S)', indent_to_nbsp, body_text, flags=re.MULTILINE)
@@ -668,17 +683,20 @@ async def process_due(user_id, settings, due_dt, note, task_text=None, task_colu
 # --- ЗАПУСК БОТА ---
 async def main():
     """Главная асинхронная функция. Регистрирует команды, настраивает планировщик, запускает поллинг."""
-    # Роутер импортируется здесь, а не на уровне модуля, — чтобы избежать циклического импорта
+    # Роутер импортируется здесь, а не на уровне модуля, — чтобы избежать циклических импортов
     import handlers
     dp.include_router(handlers.router)
 
-    await bot.set_my_commands([
+    commands = [
         BotCommand(command="start", description="Запустить бота / включить уведомления"),
         BotCommand(command="stop", description="Остановить уведомления"),
         BotCommand(command="menu", description="Открыть главное меню"),
         BotCommand(command="help", description="Справка по боту")
-    ])
+    ]
+    # scheduler и observer объявляются до try: finally гарантированно увидит обе
+    # переменные, даже если падение случится на самом раннем шаге запуска
     scheduler = AsyncIOScheduler(timezone=config.TZ)
+    observer = None
     # Проверка дедлайнов — каждую минуту
     scheduler.add_job(check_and_notify, 'cron', minute='*')
 
@@ -689,39 +707,65 @@ async def main():
     except Exception as e:
         logging.error(f"Ошибка парсинга DIGEST_TIME: {e}")
 
-    scheduler.start()
-    logging.info(f"Планировщик запущен. Бот работает для CHAT_ID: {config.ALLOWED_ID}")
-
-    # Инициализация Watchdog (мгновенный сброс кэша при изменении файлов)
-    observer = None
-    if WATCHDOG_AVAILABLE:
-        observer = Observer()
-        vault_path = config.VAULT_PATH
-        if os.path.exists(vault_path):
-            observer.schedule(VaultEventHandler(), vault_path, recursive=True)
-            observer.start()
-            logging.info(f"Watchdog запущен для папки: {vault_path}")
-        else:
-            logging.warning(f"Папка не найдена для Watchdog: {vault_path}")
-    else:
-        logging.info("Библиотека watchdog не установлена. Кэш обновляется по таймеру (30 сек).")
-
-    # Поллинг с автоматическим переподключением при сетевых сбоях
     try:
+        # Сетевые сбои на set_my_commands (прокси, 5xx Telegram) не роняют бота:
+        # 3 попытки с линейным бэкоффом. Меню хранится на стороне Telegram, поэтому
+        # после исчерпания попыток бот продолжает работу с прежним меню.
+        for attempt in range(1, 4):
+            try:
+                await bot.set_my_commands(commands)
+                break
+            except NETWORK_ERRORS as e:
+                logging.warning(f"[СТАРТ] Меню не задано: {e} (попытка {attempt}/3)")
+                await asyncio.sleep(2 * attempt)
+        else:  # выполняется, только если ни одна попытка не дошла до break
+            logging.warning("[СТАРТ] Меню команд не обновлено — работаем с прежним")
+
+        # Планировщик и Watchdog запускаются внутри try: при их падении срабатывает
+        # finally с корректным закрытием сессии (без «Unclosed client session»)
+        scheduler.start()
+        logging.info(f"Планировщик запущен. Бот работает для CHAT_ID: {config.ALLOWED_ID}")
+
+        # Инициализация Watchdog (мгновенный сброс кэша при изменении файлов)
+        if WATCHDOG_AVAILABLE:
+            observer = Observer()
+            vault_path = config.VAULT_PATH
+            if os.path.exists(vault_path):
+                observer.schedule(VaultEventHandler(), vault_path, recursive=True)
+                observer.start()
+                logging.info(f"Watchdog запущен для папки: {vault_path}")
+            else:
+                logging.warning(f"Папка не найдена для Watchdog: {vault_path}")
+        else:
+            logging.info("Библиотека watchdog не установлена. Кэш обновляется по таймеру (30 сек).")
+
+        # Поллинг с автоматическим переподключением при сетевых сбоях
         while True:
             try:
                 logging.info("Попытка запустить поллинг...")
                 await dp.start_polling(bot)
                 break
-            except (ClientError, ConnectionError, OSError) as e:
+            # Сетевые сбои ловятся по NETWORK_ERRORS (определение — вверху файла):
+            # сюда попадают и обертки aiogram, и сырые сбои прокси
+            except NETWORK_ERRORS as e:
                 logging.error(f"Потеряно соединение: {e}. Переподключение через 15 секунд...")
+                # aiogram не снимает свои SIGINT/SIGTERM-хендлеры после падения старта и в
+                # паузе переподключения молча поглощает Ctrl+C. Снимаем их на время паузы:
+                # сигнал остановки срабатывает и здесь (следующий start_polling вернет их)
+                with suppress(NotImplementedError):  # Windows: сигнал-хендлеры недоступны
+                    loop = asyncio.get_running_loop()
+                    loop.remove_signal_handler(signal.SIGINT)
+                    loop.remove_signal_handler(signal.SIGTERM)
                 await asyncio.sleep(15)
             except Exception as e:
                 logging.exception(f"Критическая ошибка бота: {e}")
                 break
     finally:
-        scheduler.shutdown()
-        if observer:
+        # Останавливаются только запущенные сервисы: shutdown незапущенного планировщика
+        # бросает SchedulerNotRunningError и маскирует исходную ошибку
+        if scheduler.running:
+            scheduler.shutdown()
+        if observer and observer.is_alive():
             observer.stop()
             observer.join()
         await bot.session.close()
